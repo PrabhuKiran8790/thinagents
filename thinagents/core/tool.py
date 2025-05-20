@@ -327,7 +327,6 @@ def _generate_param_schema(
         actual_type, *metadata = get_args(annotation)
         base_type = actual_type
         param_description_from_annotated = next(
-            # Ensure description is not mistaken for a Pydantic Field description format
             (m for m in metadata if isinstance(m, str) and not m.startswith(":")),
             None,
         )
@@ -335,14 +334,10 @@ def _generate_param_schema(
     core_type_schema = map_type_to_schema(base_type)
     param_final_schema = core_type_schema.copy()  # Start with base schema
 
-    # Override title with capitalized parameter name
     param_final_schema["title"] = name.replace("_", " ").capitalize()
 
-    # Override description if provided via Annotated
     if param_description_from_annotated:
         param_final_schema["description"] = param_description_from_annotated
-    # If no Annotated description, and core_type_schema had one (e.g., from Pydantic model), it's preserved.
-
     if param.default is not inspect.Parameter.empty:
         param_final_schema["default"] = param.default
 
@@ -352,29 +347,22 @@ def _generate_param_schema(
 def _is_required_parameter(param: inspect.Parameter, annotation: Any) -> bool:
     if param.default is not inspect.Parameter.empty:
         return False  # Has a default value, so not required
-
-    # Unwrap Annotated to check the underlying type for optionality
+    
     current_type_to_check = annotation
     if get_origin(current_type_to_check) is Annotated:
         args = get_args(current_type_to_check)
         if args:  # Annotated[type, ...]
             current_type_to_check = args[0]  # The actual type
 
-    # Check for Optional[T] or Union[T, None]
     origin = get_origin(current_type_to_check)
     args = get_args(current_type_to_check)
 
     if origin is Union:
         if type(None) in args:
             return False  # It's a Union including None, so effectively optional
-    # Note: `Optional[T]` is just `Union[T, NoneType]`, so the above `Union` check covers it.
-    # An explicit `origin is Optional` check might be redundant but harmless.
     elif origin is Optional:
         return False  # It's Optional, so not required
 
-    # If annotation is Any or empty, and no default, assume required unless specified otherwise.
-    # This behavior might need adjustment based on desired strictness.
-    # If it's Any or Parameter.empty and has no default, it's considered required.
     if annotation is Any or annotation is inspect.Parameter.empty:
         return True
 

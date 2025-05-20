@@ -38,12 +38,15 @@ class Agent:
         api_base: Optional[str] = None,
         api_version: Optional[str] = None,
         tools: Optional[Union[List[ThinAgentsTool], List[Callable]]] = None,
+        sub_agents: Optional[List["Agent"]] = None,
         prompt: Optional[Union[str, PromptConfig]] = None,
+        instructions: Optional[List[str]] = None,
         max_steps: int = 15,
         parallel_tool_calls: bool = False,
         concurrent_tool_execution: bool = True,
         response_format: Optional[Type[BaseModel]] = None,
         enable_schema_validation: bool = True,
+        description: Optional[str] = None,
         **kwargs,
     ):
         """
@@ -57,8 +60,14 @@ class Agent:
             api_version: Optional API version, required by some providers like Azure OpenAI.
             tools: A list of tools that the agent can use.
                 Tools can be instances of `ThinAgentsTool` or callable functions decorated with `@tool`.
+            sub_agents: A list of `Agent` instances that should be exposed as tools to this
+                parent agent. Each sub-agent will be wrapped in a ThinAgents tool that takes a
+                single string parameter named `input` and returns the sub-agent's response. This
+                allows the parent agent to delegate work to specialised child agents.
             prompt: The system prompt to guide the agent's behavior.
                 This can be a simple string or a `PromptConfig` object for more complex prompt engineering.
+            instructions: A list of additional instruction strings to be appended to the system prompt.
+                Ignored when `prompt` is an instance of `PromptConfig`.
             max_steps: The maximum number of conversational turns or tool execution
                 sequences the agent will perform before stopping. Defaults to 15.
             parallel_tool_calls: If True, allows the agent to request multiple tool calls
@@ -70,6 +79,7 @@ class Agent:
                 This should be a Pydantic model.
             enable_schema_validation: If True, enables schema validation for the response format.
                 Defaults to True.
+            description: Optional description for the agent.
             **kwargs: Additional keyword arguments that will be passed directly to the `litellm.completion` function.
         """
 
@@ -80,15 +90,45 @@ class Agent:
         self.api_version = api_version
         self.max_steps = max_steps
         self.prompt = prompt
-        self.tool_schemas, self.tool_maps = generate_tool_schemas(tools or [])
-        self.parallel_tool_calls = parallel_tool_calls
-        self.concurrent_tool_execution = concurrent_tool_execution
-        self.kwargs = kwargs
+        self.instructions = instructions or []
+        self.sub_agents = sub_agents or []
+        self.description = description
 
         self.response_format = response_format
         self.enable_schema_validation = enable_schema_validation
         if self.response_format:
             litellm.enable_json_schema_validation = self.enable_schema_validation
+
+        self.parallel_tool_calls = parallel_tool_calls
+        self.concurrent_tool_execution = concurrent_tool_execution
+        self.kwargs = kwargs
+
+        self._provided_tools = tools or []
+
+        def _make_sub_agent_tool(sa: "Agent") -> ThinAgentsTool:
+            """Create a ThinAgents tool that delegates calls to a sub-agent."""
+            safe_name = sa.name.lower().strip().replace(" ", "_")
+
+            def _delegate_to_sub_agent(input: str):
+                """Delegate input to the sub-agent."""
+                return sa.run(input)
+
+            _delegate_to_sub_agent.__name__ = f"subagent_{safe_name}"
+
+            _delegate_to_sub_agent.__doc__ = sa.description or (
+                f"Forward the input to the '{sa.name}' sub-agent and return its response."
+            )
+
+            return tool_decorator(_delegate_to_sub_agent)
+
+        sub_agent_tools: List[ThinAgentsTool] = [_make_sub_agent_tool(sa) for sa in self.sub_agents]
+
+
+        if len(sub_agent_tools) > 0:
+            print(sub_agent_tools[0].tool_schema())
+
+        combined_tools = (tools or []) + sub_agent_tools
+        self.tool_schemas, self.tool_maps = generate_tool_schemas(combined_tools)
 
     def _execute_tool(self, tool_name: str, tool_args: dict):
         """Executes a tool by name with the provided arguments."""
@@ -101,23 +141,31 @@ class Agent:
         steps = 0
         messages: List[Dict] = []
 
-        if self.prompt is None:
-            messages.append(
-                {
-                    "role": "system",
-                    "content": f"""
+        # Construct the system prompt while respecting the different prompt types and instructions
+        if isinstance(self.prompt, PromptConfig):
+            # When using PromptConfig, defer entirely to it and ignore separate instructions
+            system_prompt = self.prompt.add_instruction(
+                f"Your name is {self.name}"
+            ).build()
+        else:
+            # Either a raw string prompt or no prompt at all
+            if self.prompt is None:
+                base_prompt = (
+                    f"""
                     You are a helpful assistant. Answer the user's question to the best of your ability.
                     You are given a name, your name is {self.name}.
-                    """,
-                }
-            )
-        else:
-            system_prompt = (
-                self.prompt.add_instruction(f"Your name is {self.name}").build()
-                if isinstance(self.prompt, PromptConfig)
-                else self.prompt
-            )
-            messages.append({"role": "system", "content": system_prompt})
+                    """
+                )
+            else:
+                base_prompt = self.prompt
+
+            # Append any additional instructions if provided
+            if self.instructions:
+                base_prompt = f"{base_prompt}\n" + "\n".join(self.instructions)
+
+            system_prompt = base_prompt
+
+        messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": input})
 
         while steps < self.max_steps:
@@ -150,7 +198,6 @@ class Agent:
                         )
                         return message.content  # type: ignore
                     except Exception as e:
-                        # ask LLM to fix the error and return the fixed JSON
                         messages.append(
                             {
                                 "role": "user",
@@ -279,4 +326,14 @@ class Agent:
         return "Max steps reached without final answer."
 
     def __repr__(self) -> str:
-        return f"Agent(name={self.name}, model={self.model}, tools={[t for t in self.tool_maps.keys()]})"
+        provided_tool_names = [
+            getattr(t, "__name__", str(t)) for t in self._provided_tools
+        ]
+        
+        repr_str = f"Agent(name={self.name}, model={self.model}, tools={provided_tool_names}"
+        if self.sub_agents:
+            sub_agent_names = [sa.name for sa in self.sub_agents]
+            repr_str += f", sub_agents={sub_agent_names}"
+        repr_str += ")"
+        
+        return repr_str
