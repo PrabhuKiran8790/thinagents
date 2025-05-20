@@ -123,10 +123,6 @@ class Agent:
 
         sub_agent_tools: List[ThinAgentsTool] = [_make_sub_agent_tool(sa) for sa in self.sub_agents]
 
-
-        if len(sub_agent_tools) > 0:
-            print(sub_agent_tools[0].tool_schema())
-
         combined_tools = (tools or []) + sub_agent_tools
         self.tool_schemas, self.tool_maps = generate_tool_schemas(combined_tools)
 
