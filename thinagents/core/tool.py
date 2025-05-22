@@ -1,3 +1,4 @@
+import contextlib
 from typing import (
     Any,
     Callable,
@@ -7,7 +8,7 @@ from typing import (
     get_args,
     get_origin,
     Annotated,
-    Protocol,  # Already imported
+    Protocol,
     Literal,
     Final,
     ClassVar,
@@ -41,7 +42,7 @@ _PYDANTIC_V2 = False
 _BaseModel = object
 IS_PYDANTIC_AVAILABLE = False
 
-try:
+with contextlib.suppress(ImportError):
     from pydantic import BaseModel as PydanticBaseModel
     from pydantic import __version__ as pydantic_version
 
@@ -53,8 +54,6 @@ try:
 
     if _PYDANTIC_V1 or _PYDANTIC_V2:
         IS_PYDANTIC_AVAILABLE = True
-except ImportError:
-    pass
 
 
 @runtime_checkable
@@ -65,197 +64,182 @@ class ThinAgentsTool(Protocol[P, R]):
     __name__: str
 
 
-def map_type_to_schema(py_type: Any) -> JSONSchemaType:
-    if py_type is type(None):
+_PRIMITIVE_TYPE_MAP = {
+    type(None): {"type": "null"},
+    str: {"type": "string"},
+    int: {"type": "integer"},
+    float: {"type": "number"},
+    bool: {"type": "boolean"},
+}
+
+def _handle_enum(py_type: Any) -> JSONSchemaType:
+    values = [e.value for e in py_type]
+    if all(isinstance(v, str) for v in values):
+        return {"type": "string", "enum": values}
+    if all(isinstance(v, int) for v in values):
+        return {"type": "integer", "enum": values}
+    if all(isinstance(v, (int, float)) for v in values):
+        return {"type": "number", "enum": values}
+    return {"enum": values}
+
+def _handle_sequence(py_type: Any, args: tuple) -> JSONSchemaType:
+    item_type = args[0] if args else Any
+    return {"type": "array", "items": map_type_to_schema(item_type)}
+
+def _handle_tuple(args: tuple) -> JSONSchemaType:
+    if not args:
+        return {"type": "array"}
+    if len(args) == 2 and args[1] is Ellipsis:
+        return {"type": "array", "items": map_type_to_schema(args[0])}
+    return {
+        "type": "array",
+        "prefixItems": [map_type_to_schema(arg) for arg in args],
+        "minItems": len(args),
+        "maxItems": len(args),
+    }
+
+def _handle_dataclass(py_type: Any) -> JSONSchemaType:
+    props = {}
+    required = []
+    dc_fields = fields(py_type)
+    type_hints_for_dc = get_type_hints(py_type, include_extras=True)
+
+    for field in dc_fields:
+        field_type = type_hints_for_dc.get(field.name, field.type)
+        props[field.name] = map_type_to_schema(field_type)
+        if _is_required_field(field, field_type):
+            required.append(field.name)
+
+    return {
+        "type": "object",
+        "properties": props,
+        "required": sorted(list(set(required))),
+        "additionalProperties": False,
+    }
+
+def _is_required_field(field: Any, field_type: Any) -> bool:
+    if field.default is not inspect.Parameter.empty:
+        return False
+    origin = get_origin(field_type)
+    args = get_args(field_type)
+    return (origin is not Union or type(None) not in args) and (
+        origin is Union or origin is not Optional
+    )
+
+def _handle_union(args: tuple) -> JSONSchemaType:
+    non_none_args = [a for a in args if a is not type(None)]
+    if not non_none_args:
         return {"type": "null"}
-    if py_type is str:
-        return {"type": "string"}
-    if py_type is int:
-        return {"type": "integer"}
-    if py_type is float:
-        return {"type": "number"}
-    if py_type is bool:
-        return {"type": "boolean"}
+    
+    schemas = [map_type_to_schema(a) for a in non_none_args]
+    if type(None) in args:
+        schemas.append({"type": "null"})
+    return {"anyOf": schemas}
 
-    if isinstance(py_type, type) and issubclass(py_type, enum.Enum):
-        values = [e.value for e in py_type]
-        if all(isinstance(v, str) for v in values):
-            return {"type": "string", "enum": values}
-        if all(isinstance(v, int) for v in values):
-            return {"type": "integer", "enum": values}
-        if all(isinstance(v, (int, float)) for v in values):
-            return {"type": "number", "enum": values}
-        return {"enum": values}
+@runtime_checkable
+class TypeHandler(Protocol):
+    def can_handle(self, py_type: Any) -> bool: ...
+    def handle(self, py_type: Any, schema_mapper: Callable[[Any], JSONSchemaType]) -> JSONSchemaType: ...
 
-    if (
-        IS_PYDANTIC_AVAILABLE
-        and isinstance(py_type, type)
-        and issubclass(py_type, _BaseModel)
-    ):
+class BaseTypeHandler:
+    def can_handle(self, py_type: Any) -> bool:
+        return False
+
+    def handle(self, py_type: Any, schema_mapper: Callable[[Any], JSONSchemaType]) -> JSONSchemaType:
+        return {"type": "object"}
+
+class PrimitiveHandler(BaseTypeHandler):
+    def can_handle(self, py_type: Any) -> bool:
+        return py_type in _PRIMITIVE_TYPE_MAP
+
+    def handle(self, py_type: Any, _: Callable[[Any], JSONSchemaType]) -> JSONSchemaType:
+        return _PRIMITIVE_TYPE_MAP[py_type]
+
+class EnumHandler(BaseTypeHandler):
+    def can_handle(self, py_type: Any) -> bool:
+        return isinstance(py_type, type) and issubclass(py_type, enum.Enum)
+
+    def handle(self, py_type: Any, _: Callable[[Any], JSONSchemaType]) -> JSONSchemaType:
+        return _handle_enum(py_type)
+
+class PydanticHandler(BaseTypeHandler):
+    def can_handle(self, py_type: Any) -> bool:
+        return (IS_PYDANTIC_AVAILABLE and isinstance(py_type, type) 
+                and issubclass(py_type, _BaseModel))
+
+    def handle(self, py_type: Any, _: Callable[[Any], JSONSchemaType]) -> JSONSchemaType:
         schema: Optional[JSONSchemaType] = None
         if _PYDANTIC_V2 and hasattr(py_type, "model_json_schema"):
             schema = py_type.model_json_schema()  # type: ignore
         elif _PYDANTIC_V1 and hasattr(py_type, "schema"):
             schema = py_type.schema()  # type: ignore
+        return schema if schema is not None else {"type": "object"}
 
-        if schema is not None:
-            return schema
+class SequenceHandler(BaseTypeHandler):
+    def can_handle(self, py_type: Any) -> bool:
+        origin = get_origin(py_type)
+        return (origin in (list, List) or 
+                (isinstance(py_type, type) and issubclass(py_type, Sequence) 
+                 and not issubclass(py_type, (str, bytes, bytearray))))
 
+    def handle(self, py_type: Any, schema_mapper: Callable[[Any], JSONSchemaType]) -> JSONSchemaType:
+        return _handle_sequence(py_type, get_args(py_type))
+
+_type_handlers = [
+    PrimitiveHandler(),
+    EnumHandler(),
+    PydanticHandler(),
+    SequenceHandler(),
+]
+
+def map_type_to_schema(py_type: Any) -> JSONSchemaType:
     origin = get_origin(py_type)
+    args = get_args(py_type)
+
+    for handler in _type_handlers:
+        if handler.can_handle(py_type):
+            return handler.handle(py_type, map_type_to_schema)
 
     if origin is Literal:
-        literal_values = get_args(py_type)
-        if all(isinstance(v, str) for v in literal_values):
-            return {"type": "string", "enum": list(literal_values)}
-        if all(isinstance(v, int) for v in literal_values):
-            return {"type": "integer", "enum": list(literal_values)}
-        if all(isinstance(v, (int, float)) for v in literal_values):
-            return {"type": "number", "enum": list(literal_values)}
-        return {"enum": list(literal_values)}
-
-    if origin in (list, List) or (
-        isinstance(py_type, type)
-        and issubclass(py_type, Sequence)
-        and not issubclass(py_type, (str, bytes, bytearray))
-    ):
-        args = get_args(py_type)
-        item_type = args[0] if args else Any
-        return {"type": "array", "items": map_type_to_schema(item_type)}
+        return _handle_enum(lambda: args)
 
     if origin in (tuple, Tuple):
-        args = get_args(py_type)
-        if not args:
-            return {"type": "array"}
-        if len(args) == 2 and args[1] is Ellipsis:
-            return {"type": "array", "items": map_type_to_schema(args[0])}
-        return {
-            "type": "array",
-            "prefixItems": [map_type_to_schema(arg) for arg in args],
-            "minItems": len(args),
-            "maxItems": len(args),
-        }
+        return _handle_tuple(args)
 
     if origin in (set, Set, frozenset, FrozenSet):
-        args = get_args(py_type)
-        item_type = args[0] if args else Any
-        return {
-            "type": "array",
-            "items": map_type_to_schema(item_type),
-            "uniqueItems": True,
-        }
+        return {**_handle_sequence(py_type, args), "uniqueItems": True}
 
     if is_dataclass(py_type):
-        props = {}
-        required = []
-        dc_fields = fields(py_type)
-        type_hints_for_dc = get_type_hints(py_type, include_extras=True)
+        return _handle_dataclass(py_type)
 
-        for field in dc_fields:
-            field_type = type_hints_for_dc.get(field.name, field.type)
-            props[field.name] = map_type_to_schema(field_type)
-
-            is_optional_type = False
-            field_origin = get_origin(field_type)
-            field_args = get_args(field_type)
-
-            if field_origin is Union and type(None) in field_args:
-                is_optional_type = True
-            elif (
-                field_origin is Optional
-            ):  # Optional is syntactic sugar for Union[T, None]
-                is_optional_type = True
-
-            if (
-                getattr(field, "default", inspect.Parameter.empty)
-                is inspect.Parameter.empty  # More robust check for default
-                and getattr(field, "default_factory", inspect.Parameter.empty)
-                is inspect.Parameter.empty  # More robust check for default_factory
-                and not is_optional_type
-            ):
-                required.append(field.name)
-        return {
-            "type": "object",
-            "properties": props,
-            "required": sorted(list(set(required))),  # Ensure uniqueness and order
-            "additionalProperties": False,
-        }
-
-    if origin in (dict, Dict) or (
-        isinstance(py_type, type) and issubclass(py_type, Mapping)
-    ):
-        args = get_args(py_type)
-        if args and len(args) == 2:
-            key_type, value_type = args
-            schema_for_mapping = {
-                "type": "object",
-                "additionalProperties": map_type_to_schema(value_type),
-            }
-            if key_type is not str:  # JSON object keys must be strings
-                schema_for_mapping["x-key-type"] = str(
-                    key_type
-                )  # Non-standard, but informative
-            return schema_for_mapping
-        else:  # Dict without type args, or Mapping without type args
+    if origin in (dict, Dict) or (isinstance(py_type, type) and issubclass(py_type, Mapping)):
+        if not args or len(args) != 2:
             return {"type": "object", "additionalProperties": map_type_to_schema(Any)}
+        key_type, value_type = args
+        schema = {"type": "object", "additionalProperties": map_type_to_schema(value_type)}
+        if key_type is not str:
+            schema["x-key-type"] = str(key_type)
+        return schema
 
     if origin is Union:
-        args = get_args(py_type)
-        non_none_args = [a for a in args if a is not type(None)]
+        return _handle_union(args)
 
-        if not non_none_args:  # Union of only NoneType e.g. Union[None]
-            return {"type": "null"}
+    if origin is Optional:
+        return _handle_union((args[0], type(None))) if args else {"type": "null"}
 
-        # Handle Optional[T] as Union[T, NoneType]
-        if type(None) in args:
-            if len(non_none_args) == 1:  # This is effectively Optional[T]
-                # OpenAPI 3.0+ suggests nullable: true, or combining with null type in anyOf/oneOf
-                # For broader compatibility, using anyOf is safer.
-                return {
-                    "anyOf": [map_type_to_schema(non_none_args[0]), {"type": "null"}]
-                }
-            else:  # Union[A, B, NoneType]
-                return {
-                    "anyOf": [map_type_to_schema(a) for a in non_none_args]
-                    + [{"type": "null"}]
-                }
-        else:  # Union[A, B] (no NoneType)
-            return {"anyOf": [map_type_to_schema(a) for a in args]}
-
-    # Optional[T] is handled by the Union case above because get_origin(Optional[T]) is Union
-    # and get_args(Optional[T]) is (T, type(None)).
-    # This specific 'origin is Optional' block might be redundant if Union handles it comprehensively.
-    # However, sometimes type hints resolve Optional directly.
-    if origin is Optional:  # Explicit check for Optional, though Union often catches it
-        args = get_args(py_type)
-        # args for Optional[T] will be (T, type(None))
-        # If it's just Optional without a type (should not happen with valid type hints for Optional[X])
-        # or if the first arg is None (e.g. Optional[None]), treat as null.
-        if args and args[0] is not type(None):
-            # This effectively becomes map_type_to_schema(Union[args[0], type(None)])
-            return {"anyOf": [map_type_to_schema(args[0]), {"type": "null"}]}
-        return {"type": "null"}
-
-    if origin is Final or origin is ClassVar:
-        args = get_args(py_type)
-        if args:
-            return map_type_to_schema(args[0])
-        return {}  # Should not happen if used correctly, e.g., Final[int]
+    if origin in (Final, ClassVar):
+        return map_type_to_schema(args[0]) if args else {}
 
     if py_type is Any:
-        return {}  # Represents any type, often no specific schema constraints
+        return {}
 
     if isinstance(py_type, TypeVar):
-        constraints = getattr(py_type, "__constraints__", None)
-        if constraints:  # For TypeVar('T', int, str)
+        if constraints := getattr(py_type, "__constraints__", None):
             return {"anyOf": [map_type_to_schema(c) for c in constraints]}
         bound = getattr(py_type, "__bound__", None)
-        if bound and bound is not object:  # For TypeVar('T', bound=Sequence)
-            return map_type_to_schema(bound)
-        return {}  # Unconstrained TypeVar, like Any
+        return map_type_to_schema(bound) if bound and bound is not object else {}
 
-    # Default for unrecognized types or classes
-    # Consider logging a warning here if a more specific schema is expected
-    return {"type": "object"}  # Or simply {} if no assumptions can be made
+    return {"type": "object"}
 
 
 def tool(fn_for_tool: Callable[P, R]) -> ThinAgentsTool[P, R]:
@@ -346,24 +330,16 @@ def _generate_param_schema(
 
 def _is_required_parameter(param: inspect.Parameter, annotation: Any) -> bool:
     if param.default is not inspect.Parameter.empty:
-        return False  # Has a default value, so not required
-    
+        return False
     current_type_to_check = annotation
     if get_origin(current_type_to_check) is Annotated:
         args = get_args(current_type_to_check)
-        if args:  # Annotated[type, ...]
-            current_type_to_check = args[0]  # The actual type
+        if args:
+            current_type_to_check = args[0]
 
     origin = get_origin(current_type_to_check)
     args = get_args(current_type_to_check)
 
-    if origin is Union:
-        if type(None) in args:
-            return False  # It's a Union including None, so effectively optional
-    elif origin is Optional:
-        return False  # It's Optional, so not required
-
-    if annotation is Any or annotation is inspect.Parameter.empty:
-        return True
-
-    return True  # No default, not Optional/Union[..., None], so it's required
+    return (origin is not Union or type(None) not in args) and (
+        origin is Union or origin is not Optional
+    )

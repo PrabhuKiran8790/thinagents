@@ -16,4 +16,5 @@ from thinagents.core.agent import Agent
 from thinagents.utils.prompts import PromptConfig
 from thinagents.core.tool import tool
 
+
 __all__ = ["Agent", "PromptConfig", "tool"]
