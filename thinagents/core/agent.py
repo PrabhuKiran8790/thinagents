@@ -3,13 +3,21 @@ Implementation of the Agent class
 """
 
 import json
-from typing import Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Callable, Dict, List, Optional, Tuple, Type, Union, TypeVar, Generic, cast
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import litellm
 from litellm import completion as litellm_completion
+from pydantic import BaseModel # type: ignore
 from thinagents.core.tool import ThinAgentsTool, tool as tool_decorator
 from thinagents.utils.prompts import PromptConfig
-from pydantic import BaseModel
+from thinagents.core.response_models import (
+    ThinagentResponse as GenericThinagentResponse,
+    UsageMetrics,
+    CompletionTokensDetails,
+    PromptTokensDetails,
+)
+
+_ExpectedContentType = TypeVar('_ExpectedContentType')
 
 
 def generate_tool_schemas(
@@ -29,7 +37,7 @@ def generate_tool_schemas(
     return tool_schemas, tool_maps
 
 
-class Agent:
+class Agent(Generic[_ExpectedContentType]):
     def __init__(
         self,
         name: str,
@@ -94,9 +102,9 @@ class Agent:
         self.sub_agents = sub_agents or []
         self.description = description
 
-        self.response_format = response_format
+        self.response_format_model_type = response_format
         self.enable_schema_validation = enable_schema_validation
-        if self.response_format:
+        if self.response_format_model_type:
             litellm.enable_json_schema_validation = self.enable_schema_validation
 
         self.parallel_tool_calls = parallel_tool_calls
@@ -133,18 +141,15 @@ class Agent:
             raise ValueError(f"Tool '{tool_name}' not found.")
         return tool(**tool_args)
 
-    def run(self, input: str) -> str:
+    def run(self, input: str) -> GenericThinagentResponse[_ExpectedContentType]:
         steps = 0
         messages: List[Dict] = []
 
-        # Construct the system prompt while respecting the different prompt types and instructions
         if isinstance(self.prompt, PromptConfig):
-            # When using PromptConfig, defer entirely to it and ignore separate instructions
             system_prompt = self.prompt.add_instruction(
                 f"Your name is {self.name}"
             ).build()
         else:
-            # Either a raw string prompt or no prompt at all
             if self.prompt is None:
                 base_prompt = (
                     f"""
@@ -155,7 +160,6 @@ class Agent:
             else:
                 base_prompt = self.prompt
 
-            # Append any additional instructions if provided
             if self.instructions:
                 base_prompt = f"{base_prompt}\n" + "\n".join(self.instructions)
 
@@ -174,9 +178,47 @@ class Agent:
                 tools=self.tool_schemas,
                 tool_choice="auto",
                 parallel_tool_calls=self.parallel_tool_calls,
-                response_format=self.response_format,
+                response_format=self.response_format_model_type,
                 **self.kwargs,
             )
+
+            response_id = getattr(response, "id", None)
+            created_timestamp = getattr(response, "created", None)
+            model_used = getattr(response, "model", None)
+            system_fingerprint = getattr(response, "system_fingerprint", None)
+            raw_usage = getattr(response, "usage", None)
+            metrics = None
+
+            if raw_usage:
+                ct_details_data = getattr(raw_usage, "completion_tokens_details", None)
+                pt_details_data = getattr(raw_usage, "prompt_tokens_details", None)
+
+                ct_details = None
+                if ct_details_data:
+                    ct_details = CompletionTokensDetails(
+                        accepted_prediction_tokens=getattr(ct_details_data, "accepted_prediction_tokens", None),
+                        audio_tokens=getattr(ct_details_data, "audio_tokens", None),
+                        reasoning_tokens=getattr(ct_details_data, "reasoning_tokens", None),
+                        rejected_prediction_tokens=getattr(ct_details_data, "rejected_prediction_tokens", None),
+                        text_tokens=getattr(ct_details_data, "text_tokens", None),
+                    )
+
+                pt_details = None
+                if pt_details_data:
+                    pt_details = PromptTokensDetails(
+                        audio_tokens=getattr(pt_details_data, "audio_tokens", None),
+                        cached_tokens=getattr(pt_details_data, "cached_tokens", None),
+                        text_tokens=getattr(pt_details_data, "text_tokens", None),
+                        image_tokens=getattr(pt_details_data, "image_tokens", None),
+                    )
+                
+                metrics = UsageMetrics(
+                    completion_tokens=getattr(raw_usage, "completion_tokens", None),
+                    prompt_tokens=getattr(raw_usage, "prompt_tokens", None),
+                    total_tokens=getattr(raw_usage, "total_tokens", None),
+                    completion_tokens_details=ct_details,
+                    prompt_tokens_details=pt_details,
+                )
 
             finish_reason = response.choices[0].finish_reason  # type: ignore
             message = response.choices[0].message  # type: ignore
@@ -185,28 +227,51 @@ class Agent:
                 tool_calls = []
 
             if finish_reason == "stop" and not tool_calls:
-                if not self.response_format:
-                    return message.content  # type: ignore
-                else:
+                raw_content_from_llm = message.content
+                final_content: _ExpectedContentType
+                content_type_to_return: str
+
+                if self.response_format_model_type:
                     try:
-                        self.response_format.model_validate_json(
-                            message.content  # type: ignore
+                        parsed_model = self.response_format_model_type.model_validate_json(
+                            raw_content_from_llm  # type: ignore
                         )
-                        return message.content  # type: ignore
+                        final_content = cast(_ExpectedContentType, parsed_model)
+                        content_type_to_return = self.response_format_model_type.__name__
                     except Exception as e:
                         messages.append(
                             {
                                 "role": "user",
-                                "content": f"The JSON is invalid: {e}. Please fix the JSON and return it. Returned JSON: {message.content}, Expected JSON: {self.response_format.model_json_schema()}",
+                                "content": f"The JSON is invalid: {e}. Please fix the JSON and return it. Returned JSON: {raw_content_from_llm}, Expected JSON: {self.response_format_model_type.model_json_schema()}",
                             }
                         )
-                        response = litellm_completion(
+                        correction_response = litellm_completion(
                             model=self.model,
                             messages=messages,
+                            api_key=self.api_key,
+                            api_base=self.api_base,
+                            api_version=self.api_version,
                             **self.kwargs,
                         )
-                        # do not return directly, continue the loop and if it was fixed, our above code will return the fixed JSON
-                        continue
+                        message = correction_response.choices[0].message # type: ignore
+                        messages.append({"role": message.role, "content": message.content})
+                        steps += 1 
+                        continue 
+                else: # Expecting a string
+                    final_content = cast(_ExpectedContentType, raw_content_from_llm)
+                    content_type_to_return = "str"
+                
+                return GenericThinagentResponse(
+                    content=final_content,
+                    content_type=content_type_to_return,
+                    response_id=response_id,
+                    created_timestamp=created_timestamp,
+                    model_used=model_used,
+                    finish_reason=finish_reason,
+                    metrics=metrics,
+                    system_fingerprint=system_fingerprint,
+                    extra_data=None
+                )
 
             if finish_reason == "tool_calls" or tool_calls:
                 tool_call_outputs = []
@@ -236,15 +301,29 @@ class Agent:
                             tool_call_result = self._execute_tool(
                                 tool_call_name, tool_call_args
                             )
+
+                            content_for_llm: str
+                            if isinstance(tool_call_result, GenericThinagentResponse):
+                                # Result from a sub-agent
+                                sub_agent_content_data = tool_call_result.content
+                                if isinstance(sub_agent_content_data, BaseModel): 
+                                    content_for_llm = sub_agent_content_data.model_dump_json()
+                                elif isinstance(sub_agent_content_data, str):
+                                    content_for_llm = sub_agent_content_data
+                                else: # dict, list, int, float etc. from sub_agent_content_data
+                                    content_for_llm = json.dumps(sub_agent_content_data)
+                            elif isinstance(tool_call_result, BaseModel):
+                                content_for_llm = tool_call_result.model_dump_json()
+                            elif isinstance(tool_call_result, str):
+                                content_for_llm = tool_call_result
+                            else: # dict, list, int, float etc. from a regular tool
+                                content_for_llm = json.dumps(tool_call_result)
+
                             return {
                                 "tool_call_id": tool_call_id,
                                 "role": "tool",
                                 "name": tool_call_name,
-                                "content": (
-                                    tool_call_result
-                                    if isinstance(tool_call_result, str)
-                                    else json.dumps(tool_call_result)
-                                ),
+                                "content": content_for_llm,
                             }
                         except Exception as e:
                             print(
@@ -263,7 +342,6 @@ class Agent:
                             }
 
                     if self.concurrent_tool_execution and len(tool_calls) > 1:
-                        # Concurrent execution for tool calls
                         with ThreadPoolExecutor(
                             max_workers=len(tool_calls)
                         ) as executor:
@@ -319,7 +397,18 @@ class Agent:
 
             steps += 1
 
-        return "Max steps reached without final answer."
+        final_content_on_max_steps = cast(_ExpectedContentType, "Max steps reached without final answer.")
+        return GenericThinagentResponse(
+            content=final_content_on_max_steps,
+            content_type="str",
+            response_id=response_id, 
+            created_timestamp=created_timestamp, 
+            model_used=model_used, 
+            finish_reason="max_steps_reached",
+            metrics=metrics, 
+            system_fingerprint=system_fingerprint, 
+            extra_data=None
+        )
 
     def __repr__(self) -> str:
         provided_tool_names = [
