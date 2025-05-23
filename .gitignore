@@ -76,3 +76,4 @@ logs/
 
 # everything in the tests folder
 tests/*
+plannings/*
