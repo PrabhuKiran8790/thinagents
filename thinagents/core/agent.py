@@ -1,5 +1,5 @@
 """
-Implementation of the Agent class
+Module implementing the Agent class for orchestrating LLM interactions and tool execution.
 """
 
 import json
@@ -17,12 +17,21 @@ from thinagents.core.response_models import (
     PromptTokensDetails,
 )
 
-_ExpectedContentType = TypeVar('_ExpectedContentType')
+_ExpectedContentType = TypeVar('_ExpectedContentType', bound=BaseModel)
 
 
 def generate_tool_schemas(
     tools: Union[List[ThinAgentsTool], List[Callable]],
 ) -> Tuple[List[Dict], Dict[str, ThinAgentsTool]]:
+    """
+    Generate JSON schemas for provided tools and return tool schemas list and tool maps.
+
+    Args:
+        tools: A list of ThinAgentsTool instances or callables decorated with @tool.
+
+    Returns:
+        Tuple[List[Dict], Dict[str, ThinAgentsTool]]: A list of tool schema dictionaries and a mapping from tool names to ThinAgentsTool instances.
+    """
     tool_schemas = []
     tool_maps: Dict[str, ThinAgentsTool] = {}
 
@@ -52,7 +61,7 @@ class Agent(Generic[_ExpectedContentType]):
         max_steps: int = 15,
         parallel_tool_calls: bool = False,
         concurrent_tool_execution: bool = True,
-        response_format: Optional[Type[BaseModel]] = None,
+        response_format: Optional[Type[_ExpectedContentType]] = None,
         enable_schema_validation: bool = True,
         description: Optional[str] = None,
         **kwargs,
@@ -142,6 +151,15 @@ class Agent(Generic[_ExpectedContentType]):
         return tool(**tool_args)
 
     def run(self, input: str) -> GenericThinagentResponse[_ExpectedContentType]:
+        """
+        Run the agent with the given input and manage interactions with the language model and tools.
+
+        Args:
+            input: The user's input message to the agent.
+
+        Returns:
+            GenericThinagentResponse[_ExpectedContentType]: The agent's final response, including content, content type, and usage metrics.
+        """
         steps = 0
         messages: List[Dict] = []
 
