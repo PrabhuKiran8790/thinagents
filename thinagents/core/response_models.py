@@ -45,4 +45,20 @@ class ThinagentResponse(BaseModel, Generic[_ContentType]):
     system_fingerprint: Optional[str] = Field(None, description="A system fingerprint representing the backend configuration that generated the response.")
     extra_data: Optional[Any] = Field(None, description="For any additional data from the LLM provider not covered by other fields. Defaults to None.")
 
-    model_config = ConfigDict(arbitrary_types_allowed=True, extra="ignore") 
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="ignore")
+
+
+class ThinagentResponseStream(ThinagentResponse[_ContentType], Generic[_ContentType]):
+    stream_options: Optional[Any] = Field(None, description="Streaming options for this chunk. Defaults to None.")
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="ignore")
+
+    def __repr__(self) -> str:
+        # Represent the stream response with class name and field values
+        data = self.model_dump()
+        field_str = ", ".join(f"{k}={v!r}" for k, v in data.items())
+        return f"{self.__class__.__name__}({field_str})"
+
+    def __str__(self) -> str:
+        # String representation same as repr for readability in print
+        return self.__repr__() 

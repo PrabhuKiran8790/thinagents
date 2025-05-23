@@ -3,7 +3,7 @@ Module implementing the Agent class for orchestrating LLM interactions and tool 
 """
 
 import json
-from typing import Callable, Dict, List, Optional, Tuple, Type, Union, TypeVar, Generic, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union, Iterator, TypeVar, Generic, cast, overload, Literal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import litellm
 from litellm import completion as litellm_completion
@@ -12,6 +12,7 @@ from thinagents.core.tool import ThinAgentsTool, tool as tool_decorator
 from thinagents.utils.prompts import PromptConfig
 from thinagents.core.response_models import (
     ThinagentResponse as GenericThinagentResponse,
+    ThinagentResponseStream,
     UsageMetrics,
     CompletionTokensDetails,
     PromptTokensDetails,
@@ -150,16 +151,30 @@ class Agent(Generic[_ExpectedContentType]):
             raise ValueError(f"Tool '{tool_name}' not found.")
         return tool(**tool_args)
 
-    def run(self, input: str) -> GenericThinagentResponse[_ExpectedContentType]:
+    @overload
+    def run(self, input: str, stream: Literal[False] = False, stream_intermediate_steps: bool = False) -> GenericThinagentResponse[_ExpectedContentType]:
+        ...
+    @overload
+    def run(self, input: str, stream: Literal[True], stream_intermediate_steps: bool = False) -> Iterator[ThinagentResponseStream[Any]]:
+        ...
+    def run(self, input: str, stream: bool = False, stream_intermediate_steps: bool = False) -> Any:
         """
         Run the agent with the given input and manage interactions with the language model and tools.
 
         Args:
             input: The user's input message to the agent.
+            stream: If True, returns a stream of responses instead of a single response.
+            stream_intermediate_steps: If True and stream=True, also stream intermediate tool calls and results.
 
         Returns:
-            GenericThinagentResponse[_ExpectedContentType]: The agent's final response, including content, content type, and usage metrics.
+            GenericThinagentResponse[_ExpectedContentType] when stream=False, or Iterator[ThinagentResponseStream] when stream=True.
         """
+        # Handle streaming response
+        if stream:
+            if self.response_format_model_type:
+                raise ValueError("Streaming is not supported when response_format is specified.")
+            return self._run_stream(input, stream_intermediate_steps)
+
         steps = 0
         messages: List[Dict] = []
 
@@ -294,7 +309,6 @@ class Agent(Generic[_ExpectedContentType]):
             if finish_reason == "tool_calls" or tool_calls:
                 tool_call_outputs = []
                 if tool_calls:
-
                     def _process_individual_tool_call(tc):
                         tool_call_name = tc.function.name
                         tool_call_id = tc.id
@@ -427,6 +441,209 @@ class Agent(Generic[_ExpectedContentType]):
             system_fingerprint=system_fingerprint, 
             extra_data=None
         )
+
+    def _run_stream(self, input: str, stream_intermediate_steps: bool = False) -> Iterator[ThinagentResponseStream[Any]]:
+        """
+        Streamed version of run; yields ThinagentResponseStream chunks, including interleaved tool calls/results if requested.
+        """
+        # Build initial messages
+        if isinstance(self.prompt, PromptConfig):
+            system_prompt = self.prompt.add_instruction(f"Your name is {self.name}").build()
+        else:
+            base = self.prompt or f"You are a helpful assistant. You are {self.name}."
+            if self.instructions:
+                base = f"{base}\n" + "\n".join(self.instructions)
+            system_prompt = base
+        messages: List[Dict] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": input},
+        ]
+        # Repeat until no more function calls
+        step_count = 0
+        while True:
+            step_count += 1
+            
+            # Accumulate function call args across deltas
+            call_name: Optional[str] = None
+            call_args: str = ""
+            call_id: Optional[str] = None
+            
+            # Stream chat until a function call is completed or done
+            for chunk in litellm_completion(
+                model=self.model,
+                messages=messages,
+                api_key=self.api_key,
+                api_base=self.api_base,
+                api_version=self.api_version,
+                tools=self.tool_schemas,
+                tool_choice="auto",
+                parallel_tool_calls=self.parallel_tool_calls,
+                response_format=None,
+                stream=True,
+                **self.kwargs,
+            ):
+                
+                # Raw tuple from custom streams
+                if isinstance(chunk, tuple) and len(chunk) == 2:
+                    raw, opts = chunk
+                    yield ThinagentResponseStream(
+                        content=raw,
+                        content_type="str",
+                        response_id=None,
+                        created_timestamp=None,
+                        model_used=None,
+                        finish_reason=None,
+                        metrics=None,
+                        system_fingerprint=None,
+                        extra_data=None,
+                        stream_options=opts,
+                    )
+                    continue
+                    
+                # Standard streaming choice
+                sc = chunk.choices[0]
+                delta = getattr(sc, "delta", None)
+                finish_reason = getattr(sc, "finish_reason", None)
+                
+                # Handle tool_calls (modern format)
+                tool_calls = getattr(delta, "tool_calls", None)
+                if tool_calls:
+                    for tc in tool_calls:
+                        if hasattr(tc, "function"):
+                            if tc.id:
+                                call_id = tc.id
+                            if tc.function.name:
+                                call_name = tc.function.name
+                            if tc.function.arguments:
+                                call_args += tc.function.arguments
+                                if stream_intermediate_steps:
+                                    yield ThinagentResponseStream(
+                                        content=tc.function.arguments,
+                                        content_type="tool_call_arg",
+                                        response_id=None,
+                                        created_timestamp=None,
+                                        model_used=None,
+                                        finish_reason=None,
+                                        metrics=None,
+                                        system_fingerprint=None,
+                                        extra_data=None,
+                                        stream_options=None,
+                                    )
+                
+                # Handle function_call (legacy format)
+                fc = getattr(delta, "function_call", None)
+                if fc is not None:
+                    if fc.name:
+                        call_name = fc.name
+                    if fc.arguments:
+                        call_args += fc.arguments
+                        if stream_intermediate_steps:
+                            yield ThinagentResponseStream(
+                                content=fc.arguments,
+                                content_type="tool_call_arg",
+                                response_id=None,
+                                created_timestamp=None,
+                                model_used=None,
+                                finish_reason=None,
+                                metrics=None,
+                                system_fingerprint=None,
+                                extra_data=None,
+                                stream_options=None,
+                            )
+                
+                # Check if tool/function call is complete
+                if finish_reason in ["tool_calls", "function_call"]:
+                    break
+                
+                # Otherwise, stream content tokens
+                text = getattr(delta, "content", None)
+                if text:
+                    yield ThinagentResponseStream(
+                        content=text,
+                        content_type="str",
+                        response_id=getattr(chunk, "id", None),
+                        created_timestamp=getattr(chunk, "created", None),
+                        model_used=getattr(chunk, "model", None),
+                        finish_reason=finish_reason,
+                        metrics=None,
+                        system_fingerprint=getattr(chunk, "system_fingerprint", None),
+                        extra_data=None,
+                        stream_options=None,
+                    )
+                    
+                # Check for completion without tool calls
+                if finish_reason == "stop":
+                    return
+            
+            # If a function call was made, execute and loop again
+            if call_name:
+                
+                # Optionally emit tool call event
+                if stream_intermediate_steps:
+                    yield ThinagentResponseStream(
+                        content=f"<tool_call:{call_name}>",
+                        content_type="tool_call",
+                        response_id=None,
+                        created_timestamp=None,
+                        model_used=None,
+                        finish_reason=None,
+                        metrics=None,
+                        system_fingerprint=None,
+                        extra_data=None,
+                        stream_options=None,
+                    )
+                
+                # Parse arguments and execute tool
+                try:
+                    parsed_args = json.loads(call_args) if call_args else {}
+                except Exception as e:
+                    parsed_args = {}
+                    
+                tool_result = self._execute_tool(call_name, parsed_args)
+                
+                # Optionally emit tool result
+                if stream_intermediate_steps:
+                    yield ThinagentResponseStream(
+                        content=json.dumps(tool_result),
+                        content_type="tool_result",
+                        response_id=None,
+                        created_timestamp=None,
+                        model_used=None,
+                        finish_reason=None,
+                        metrics=None,
+                        system_fingerprint=None,
+                        extra_data=None,
+                        stream_options=None,
+                    )
+                
+                # Add assistant message with tool_calls structure
+                assistant_message = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": call_id or f"call_{call_name}",
+                            "type": "function",
+                            "function": {
+                                "name": call_name,
+                                "arguments": call_args
+                            }
+                        }
+                    ]
+                }
+                messages.append(assistant_message)
+                
+                # Append the tool response
+                tool_message = {
+                    "role": "tool",
+                    "tool_call_id": call_id or f"call_{call_name}",
+                    "content": json.dumps(tool_result)
+                }
+                messages.append(tool_message)
+                
+                continue
+            
+            break
 
     def __repr__(self) -> str:
         provided_tool_names = [
