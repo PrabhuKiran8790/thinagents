@@ -98,6 +98,7 @@ class Agent(Generic[_ExpectedContentType]):
             enable_schema_validation: If True, enables schema validation for the response format.
                 Defaults to True.
             description: Optional description for the agent.
+            granular_stream: If True and stream=True, also stream character-level chunks for delta.content.
             **kwargs: Additional keyword arguments that will be passed directly to the `litellm.completion` function.
         """
 
@@ -122,6 +123,9 @@ class Agent(Generic[_ExpectedContentType]):
         self.kwargs = kwargs
 
         self._provided_tools = tools or []
+
+        # Whether to emit per-character ThinagentResponseStream chunks when streaming
+        self.granular_stream = True
 
         def _make_sub_agent_tool(sa: "Agent") -> ThinAgentsTool:
             """Create a ThinAgents tool that delegates calls to a sub-agent."""
@@ -152,12 +156,27 @@ class Agent(Generic[_ExpectedContentType]):
         return tool(**tool_args)
 
     @overload
-    def run(self, input: str, stream: Literal[False] = False, stream_intermediate_steps: bool = False) -> GenericThinagentResponse[_ExpectedContentType]:
+    def run(
+        self,
+        input: str,
+        stream: Literal[False] = False,
+        stream_intermediate_steps: bool = False,
+    ) -> GenericThinagentResponse[_ExpectedContentType]:
         ...
     @overload
-    def run(self, input: str, stream: Literal[True], stream_intermediate_steps: bool = False) -> Iterator[ThinagentResponseStream[Any]]:
+    def run(
+        self,
+        input: str,
+        stream: Literal[True],
+        stream_intermediate_steps: bool = False,
+    ) -> Iterator[ThinagentResponseStream[Any]]:
         ...
-    def run(self, input: str, stream: bool = False, stream_intermediate_steps: bool = False) -> Any:
+    def run(
+        self,
+        input: str,
+        stream: bool = False,
+        stream_intermediate_steps: bool = False,
+    ) -> Any:
         """
         Run the agent with the given input and manage interactions with the language model and tools.
 
@@ -209,7 +228,6 @@ class Agent(Generic[_ExpectedContentType]):
                 api_base=self.api_base,
                 api_version=self.api_version,
                 tools=self.tool_schemas,
-                tool_choice="auto",
                 parallel_tool_calls=self.parallel_tool_calls,
                 response_format=self.response_format_model_type,
                 **self.kwargs,
@@ -442,7 +460,11 @@ class Agent(Generic[_ExpectedContentType]):
             extra_data=None
         )
 
-    def _run_stream(self, input: str, stream_intermediate_steps: bool = False) -> Iterator[ThinagentResponseStream[Any]]:
+    def _run_stream(
+        self,
+        input: str,
+        stream_intermediate_steps: bool = False,
+    ) -> Iterator[ThinagentResponseStream[Any]]:
         """
         Streamed version of run; yields ThinagentResponseStream chunks, including interleaved tool calls/results if requested.
         """
@@ -476,7 +498,6 @@ class Agent(Generic[_ExpectedContentType]):
                 api_base=self.api_base,
                 api_version=self.api_version,
                 tools=self.tool_schemas,
-                tool_choice="auto",
                 parallel_tool_calls=self.parallel_tool_calls,
                 response_format=None,
                 stream=True,
@@ -558,6 +579,21 @@ class Agent(Generic[_ExpectedContentType]):
                 # Otherwise, stream content tokens
                 text = getattr(delta, "content", None)
                 if text:
+                    if self.granular_stream and len(text) > 1:
+                        for ch in text:
+                            yield ThinagentResponseStream(
+                                content=ch,
+                                content_type="str",
+                                response_id=getattr(chunk, "id", None),
+                                created_timestamp=getattr(chunk, "created", None),
+                                model_used=getattr(chunk, "model", None),
+                                finish_reason=finish_reason,
+                                metrics=None,
+                                system_fingerprint=getattr(chunk, "system_fingerprint", None),
+                                extra_data=None,
+                                stream_options=None,
+                            )
+                        continue
                     yield ThinagentResponseStream(
                         content=text,
                         content_type="str",
