@@ -539,7 +539,9 @@ class Agent(Generic[_ExpectedContentType]):
             finish_reason=finish_reason,
             metrics=metrics,
             system_fingerprint=system_fingerprint,
-            artifact=self._tool_artifacts
+            artifact=self._tool_artifacts,
+            tool_name=None,
+            tool_call_id=None,
         )
 
     def _handle_tool_calls(self, tool_calls: List[Any], message: Any, messages: List[Dict]) -> None:
@@ -694,6 +696,8 @@ class Agent(Generic[_ExpectedContentType]):
                         yield ThinagentResponseStream(
                             content=raw,
                             content_type="str",
+                            tool_name=None,
+                            tool_call_id=None,
                             response_id=None,
                             created_timestamp=None,
                             model_used=None,
@@ -734,6 +738,8 @@ class Agent(Generic[_ExpectedContentType]):
                                         yield ThinagentResponseStream(
                                             content=tc.function.arguments,
                                             content_type="tool_call_arg",
+                                            tool_name=tc.function.name,
+                                            tool_call_id=tc.id,
                                             response_id=getattr(chunk, "id", None),
                                             created_timestamp=getattr(chunk, "created", None),
                                             model_used=getattr(chunk, "model", None),
@@ -755,6 +761,8 @@ class Agent(Generic[_ExpectedContentType]):
                                 yield ThinagentResponseStream(
                                     content=fc.arguments,
                                     content_type="tool_call_arg",
+                                    tool_name=fc.name if hasattr(fc, 'name') else call_name,
+                                    tool_call_id=call_id,
                                     response_id=getattr(chunk, "id", None),
                                     created_timestamp=getattr(chunk, "created", None),
                                     model_used=getattr(chunk, "model", None),
@@ -777,6 +785,8 @@ class Agent(Generic[_ExpectedContentType]):
                                 yield ThinagentResponseStream(
                                     content=ch,
                                     content_type="str",
+                                    tool_name=None,
+                                    tool_call_id=None,
                                     response_id=getattr(chunk, "id", None),
                                     created_timestamp=getattr(chunk, "created", None),
                                     model_used=getattr(chunk, "model", None),
@@ -790,6 +800,8 @@ class Agent(Generic[_ExpectedContentType]):
                         yield ThinagentResponseStream(
                             content=text,
                             content_type="str",
+                            tool_name=None,
+                            tool_call_id=None,
                             response_id=getattr(chunk, "id", None),
                             created_timestamp=getattr(chunk, "created", None),
                             model_used=getattr(chunk, "model", None),
@@ -807,6 +819,8 @@ class Agent(Generic[_ExpectedContentType]):
                         yield ThinagentResponseStream(
                             content="",
                             content_type="completion",
+                            tool_name=None,
+                            tool_call_id=None,
                             response_id=getattr(chunk, "id", None),
                             created_timestamp=getattr(chunk, "created", None),
                             model_used=getattr(chunk, "model", None),
@@ -823,6 +837,8 @@ class Agent(Generic[_ExpectedContentType]):
                 yield ThinagentResponseStream(
                     content=f"Error: {e}",
                     content_type="error",
+                    tool_name=None,
+                    tool_call_id=None,
                     response_id=None,
                     created_timestamp=None,
                     model_used=None,
@@ -841,6 +857,8 @@ class Agent(Generic[_ExpectedContentType]):
                     yield ThinagentResponseStream(
                         content=f"<tool_call:{call_name}>",
                         content_type="tool_call",
+                        tool_name=call_name,
+                        tool_call_id=call_id or f"call_{call_name}",
                         response_id=None,
                         created_timestamp=None,
                         model_used=None,
@@ -880,13 +898,15 @@ class Agent(Generic[_ExpectedContentType]):
                     yield ThinagentResponseStream(
                         content=serialised_content,
                         content_type="tool_result",
+                        tool_name=call_name,
+                        tool_call_id=call_id or f"call_{call_name}",
                         response_id=None,
                         created_timestamp=None,
                         model_used=None,
                         finish_reason=final_finish_reason,
                         metrics=None,
                         system_fingerprint=None,
-                        artifact=artifact_payload if final_finish_reason == "tool_calls" else None,
+                        artifact=self._tool_artifacts.copy() if self._tool_artifacts else None,
                         stream_options=None,
                     )
                 
@@ -924,6 +944,8 @@ class Agent(Generic[_ExpectedContentType]):
         yield ThinagentResponseStream(
             content=f"Max steps ({self.max_steps}) reached",
             content_type="error",
+            tool_name=None,
+            tool_call_id=None,
             response_id=None,
             created_timestamp=None,
             model_used=None,
