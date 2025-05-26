@@ -43,7 +43,7 @@ class ThinagentResponse(BaseModel, Generic[_ContentType]):
     finish_reason: Optional[str] = Field(None, description="The reason the model stopped generating tokens (e.g., 'stop', 'tool_calls').")
     metrics: Optional[UsageMetrics] = Field(None, description="Token usage statistics and details for the request.")
     system_fingerprint: Optional[str] = Field(None, description="A system fingerprint representing the backend configuration that generated the response.")
-    extra_data: Optional[Any] = Field(None, description="For any additional data from the LLM provider not covered by other fields. Defaults to None.")
+    artifact: Optional[Any] = Field(None, description="For any additional data from the LLM provider not covered by other fields. Defaults to None.")
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="ignore")
 

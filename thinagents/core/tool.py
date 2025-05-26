@@ -242,7 +242,10 @@ def map_type_to_schema(py_type: Any) -> JSONSchemaType:
     return {"type": "object"}
 
 
-def tool(fn_for_tool: Callable[P, R]) -> ThinAgentsTool[P, R]:
+def tool(fn_for_tool: Optional[Callable[P, R]] = None, *, return_type: Literal["content", "content_and_artifact"] = "content") -> ThinAgentsTool[P, R]:  # type: ignore
+    if fn_for_tool is None:
+        # return decorator when no function provided
+        return lambda fn: tool(fn, return_type=return_type)  # type: ignore
     annotated_desc = ""
     actual_func = fn_for_tool
     if get_origin(fn_for_tool) is Annotated:
@@ -250,11 +253,40 @@ def tool(fn_for_tool: Callable[P, R]) -> ThinAgentsTool[P, R]:
         actual_func = unwrapped_func
         annotated_desc = next((m for m in meta if isinstance(m, str)), "")
 
+    # enforce return_type annotation compatibility at decoration time
+    if return_type == "content_and_artifact":
+        sig = inspect.signature(actual_func)
+        ret_ann = sig.return_annotation
+        # no annotation provided
+        if ret_ann is inspect.Signature.empty:
+            raise ValueError(
+                f"Tool '{actual_func.__name__}' declared return_type='content_and_artifact' but no return annotation found"
+            )
+        origin = get_origin(ret_ann)
+        args = get_args(ret_ann)
+        # annotation must be Tuple[...] of length 2
+        if origin not in (tuple, Tuple) or len(args) != 2:
+            raise ValueError(
+                f"Tool '{actual_func.__name__}' declared return_type='content_and_artifact' but return annotation is {ret_ann!r}, expected Tuple[content_type, artifact_type]"
+            )
+
     @functools.wraps(actual_func)
-    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-        return actual_func(*args, **kwargs)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> Any:
+        # call the actual tool function
+        result = actual_func(*args, **kwargs)
+        # if the tool declares content_and_artifact, enforce a 2-tuple return
+        if return_type == "content_and_artifact":
+            if not (isinstance(result, tuple) and len(result) == 2):
+                raise ValueError(
+                    f"Tool '{actual_func.__name__}' declared return_type='content_and_artifact' but returned {result!r}"
+                )
+        return result
+
+    # store desired return_type on the wrapper
+    wrapper.return_type = return_type  # type: ignore
 
     def tool_schema() -> Dict[str, Any]:
+        # generate original function schema
         sig = inspect.signature(actual_func)
         # include_extras=True is important for Annotated
         type_hints = get_type_hints(actual_func, include_extras=True)
@@ -281,14 +313,16 @@ def tool(fn_for_tool: Callable[P, R]) -> ThinAgentsTool[P, R]:
         func_doc = inspect.getdoc(actual_func)
         description = annotated_desc or func_doc or ""
 
-        return {
-            "type": "function",  # As per OpenAI spec
+        # wrap schema with return_type metadata
+        original_schema = {
+            "type": "function",
             "function": {
                 "name": actual_func.__name__,
                 "description": description,
                 "parameters": params_schema,
             },
         }
+        return {"tool_schema": original_schema, "return_type": return_type}
 
     setattr(wrapper, "tool_schema", tool_schema)
     wrapper.__name__ = actual_func.__name__

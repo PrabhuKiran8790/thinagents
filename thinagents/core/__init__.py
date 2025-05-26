@@ -7,5 +7,6 @@ Key components include tool definition and schema generation capabilities.
 
 from thinagents.core.tool import tool
 from thinagents.core.agent import Agent
+from thinagents.core.response_models import ThinagentResponse
 
-__all__ = ["tool", "Agent"]
+__all__ = ["tool", "Agent", "ThinagentResponse"]
