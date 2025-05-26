@@ -73,6 +73,10 @@ _PRIMITIVE_TYPE_MAP = {
 }
 
 def _handle_enum(py_type: Any) -> JSONSchemaType:
+    """
+    Convert a Python Enum type to a JSON schema representation.
+    Handles string, integer, and number enums.
+    """
     values = [e.value for e in py_type]
     if all(isinstance(v, str) for v in values):
         return {"type": "string", "enum": values}
@@ -83,10 +87,17 @@ def _handle_enum(py_type: Any) -> JSONSchemaType:
     return {"enum": values}
 
 def _handle_sequence(py_type: Any, args: tuple) -> JSONSchemaType:
+    """
+    Convert a sequence type (e.g., List, Sequence) to a JSON schema array type.
+    """
     item_type = args[0] if args else Any
     return {"type": "array", "items": map_type_to_schema(item_type)}
 
 def _handle_tuple(args: tuple) -> JSONSchemaType:
+    """
+    Convert a tuple type to a JSON schema representation.
+    Handles both fixed-length and variable-length tuples.
+    """
     if not args:
         return {"type": "array"}
     if len(args) == 2 and args[1] is Ellipsis:
@@ -99,6 +110,9 @@ def _handle_tuple(args: tuple) -> JSONSchemaType:
     }
 
 def _handle_dataclass(py_type: Any) -> JSONSchemaType:
+    """
+    Convert a dataclass type to a JSON schema object, including required fields and property types.
+    """
     props = {}
     required = []
     dc_fields = fields(py_type)
@@ -118,6 +132,9 @@ def _handle_dataclass(py_type: Any) -> JSONSchemaType:
     }
 
 def _is_required_field(field: Any, field_type: Any) -> bool:
+    """
+    Determine if a dataclass field is required based on its default value and type annotation.
+    """
     if field.default is not inspect.Parameter.empty:
         return False
     origin = get_origin(field_type)
@@ -127,6 +144,9 @@ def _is_required_field(field: Any, field_type: Any) -> bool:
     )
 
 def _handle_union(args: tuple) -> JSONSchemaType:
+    """
+    Convert a Union type (including Optional) to a JSON schema using anyOf.
+    """
     non_none_args = [a for a in args if a is not type(None)]
     if not non_none_args:
         return {"type": "null"}
@@ -138,6 +158,9 @@ def _handle_union(args: tuple) -> JSONSchemaType:
 
 @runtime_checkable
 class TypeHandler(Protocol):
+    """
+    Protocol for custom type handlers that convert Python types to JSON schema.
+    """
     def can_handle(self, py_type: Any) -> bool: ...
     def handle(self, py_type: Any, schema_mapper: Callable[[Any], JSONSchemaType]) -> JSONSchemaType: ...
 
@@ -149,6 +172,9 @@ class BaseTypeHandler:
         return {"type": "object"}
 
 class PrimitiveHandler(BaseTypeHandler):
+    """
+    Handles primitive Python types (str, int, float, bool, None) for JSON schema conversion.
+    """
     def can_handle(self, py_type: Any) -> bool:
         return py_type in _PRIMITIVE_TYPE_MAP
 
@@ -156,6 +182,9 @@ class PrimitiveHandler(BaseTypeHandler):
         return _PRIMITIVE_TYPE_MAP[py_type]
 
 class EnumHandler(BaseTypeHandler):
+    """
+    Handles Python Enum types for JSON schema conversion.
+    """
     def can_handle(self, py_type: Any) -> bool:
         return isinstance(py_type, type) and issubclass(py_type, enum.Enum)
 
@@ -163,6 +192,9 @@ class EnumHandler(BaseTypeHandler):
         return _handle_enum(py_type)
 
 class PydanticHandler(BaseTypeHandler):
+    """
+    Handles Pydantic BaseModel types for JSON schema conversion, supporting both v1 and v2.
+    """
     def can_handle(self, py_type: Any) -> bool:
         return (IS_PYDANTIC_AVAILABLE and isinstance(py_type, type) 
                 and issubclass(py_type, _BaseModel))
@@ -176,6 +208,9 @@ class PydanticHandler(BaseTypeHandler):
         return schema if schema is not None else {"type": "object"}
 
 class SequenceHandler(BaseTypeHandler):
+    """
+    Handles sequence types (lists, sequences) for JSON schema conversion.
+    """
     def can_handle(self, py_type: Any) -> bool:
         origin = get_origin(py_type)
         return (origin in (list, List) or 
@@ -193,6 +228,10 @@ _type_handlers = [
 ]
 
 def map_type_to_schema(py_type: Any) -> JSONSchemaType:
+    """
+    Main entry point for mapping a Python type annotation to a JSON schema type.
+    Delegates to registered type handlers and handles common generic types.
+    """
     origin = get_origin(py_type)
     args = get_args(py_type)
 
@@ -243,6 +282,19 @@ def map_type_to_schema(py_type: Any) -> JSONSchemaType:
 
 
 def tool(fn_for_tool: Optional[Callable[P, R]] = None, *, return_type: Literal["content", "content_and_artifact"] = "content") -> ThinAgentsTool[P, R]:  # type: ignore
+    """
+    Decorator to register a function as a ThinAgentsTool, optionally specifying the return type.
+    Enforces return type compatibility and attaches a tool_schema method for OpenAPI/JSON schema generation.
+
+    Args:
+        fn_for_tool: The function to register as a tool.
+        return_type: The return type of the tool.
+            - "content": The tool returns only content. This is the default.  
+            - "content_and_artifact": The tool returns both content and an artifact, where the artifact is something that can be sent downstream.
+
+    Returns:
+        A ThinAgentsTool object that can be used to execute the tool.
+    """
     if fn_for_tool is None:
         # return decorator when no function provided
         return lambda fn: tool(fn, return_type=return_type)  # type: ignore
@@ -275,11 +327,10 @@ def tool(fn_for_tool: Optional[Callable[P, R]] = None, *, return_type: Literal["
         # call the actual tool function
         result = actual_func(*args, **kwargs)
         # if the tool declares content_and_artifact, enforce a 2-tuple return
-        if return_type == "content_and_artifact":
-            if not (isinstance(result, tuple) and len(result) == 2):
-                raise ValueError(
-                    f"Tool '{actual_func.__name__}' declared return_type='content_and_artifact' but returned {result!r}"
-                )
+        if return_type == "content_and_artifact" and not (isinstance(result, tuple) and len(result) == 2):
+            raise ValueError(
+                f"Tool '{actual_func.__name__}' declared return_type='content_and_artifact' but returned {result!r}"
+            )
         return result
 
     # store desired return_type on the wrapper
@@ -338,6 +389,9 @@ def tool(fn_for_tool: Optional[Callable[P, R]] = None, *, return_type: Literal["
 def _generate_param_schema(
     name: str, param: inspect.Parameter, annotation: Any
 ) -> JSONSchemaType:
+    """
+    Generate a JSON schema for a function parameter, including type, title, description, and default value.
+    """
     base_type = annotation
     param_description_from_annotated: Optional[str] = None
 
@@ -363,6 +417,9 @@ def _generate_param_schema(
 
 
 def _is_required_parameter(param: inspect.Parameter, annotation: Any) -> bool:
+    """
+    Determine if a function parameter is required based on its default value and type annotation.
+    """
     if param.default is not inspect.Parameter.empty:
         return False
     current_type_to_check = annotation
