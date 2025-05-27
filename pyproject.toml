@@ -4,8 +4,18 @@ version = "0.0.2"
 description = "A lightweight AI Agent framework"
 authors = [{ name = "Prabhu Kiran Konda" }]
 readme = "README.md"
-requires-python = ">=3.10"
-dependencies = []
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["AI", "agents", "lightweight", "framework"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = ["litellm>=1.70.0", "graphviz>=0.20.0"]
+
+[project.urls]
+Homepage = "https://github.com/PrabhuKiran8790/thinagents"
 
 [build-system]
 requires = ["setuptools"]
