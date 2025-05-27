@@ -43,6 +43,21 @@ class ThinagentResponse(BaseModel, Generic[_ContentType]):
     finish_reason: Optional[str] = Field(None, description="The reason the model stopped generating tokens (e.g., 'stop', 'tool_calls').")
     metrics: Optional[UsageMetrics] = Field(None, description="Token usage statistics and details for the request.")
     system_fingerprint: Optional[str] = Field(None, description="A system fingerprint representing the backend configuration that generated the response.")
-    extra_data: Optional[Any] = Field(None, description="For any additional data from the LLM provider not covered by other fields. Defaults to None.")
+    artifact: Optional[Any] = Field(None, description="For any additional data from the LLM provider not covered by other fields. Defaults to None.")
+    tool_name: Optional[str] = Field(None, description="Name of the tool associated with this response chunk, if applicable.")
+    tool_call_id: Optional[str] = Field(None, description="Unique identifier of the tool call that produced this chunk, if applicable.")
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="ignore")
 
-    model_config = ConfigDict(arbitrary_types_allowed=True, extra="ignore") 
+
+class ThinagentResponseStream(ThinagentResponse[_ContentType], Generic[_ContentType]):
+    stream_options: Optional[Any] = Field(None, description="Streaming options for this chunk. Defaults to None.")
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="ignore")
+
+    def __repr__(self) -> str:
+        data = self.model_dump()
+        field_str = ", ".join(f"{k}={v!r}" for k, v in data.items())
+        return f"{self.__class__.__name__}({field_str})"
+
+    def __str__(self) -> str:
+        return self.__repr__() 

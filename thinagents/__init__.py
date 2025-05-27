@@ -15,6 +15,7 @@ streamlined framework.
 from thinagents.core.agent import Agent
 from thinagents.utils.prompts import PromptConfig
 from thinagents.core.tool import tool
+from thinagents.core.response_models import ThinagentResponse
 
 
-__all__ = ["Agent", "PromptConfig", "tool"]
+__all__ = ["Agent", "PromptConfig", "tool", "ThinagentResponse"]
