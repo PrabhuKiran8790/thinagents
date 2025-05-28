@@ -3,7 +3,7 @@ from pathlib import Path
 
 setup(
     name="thinagents",
-    version="0.0.2",
+    version="0.0.3",
     author="Prabhu Kiran Konda",
     description="A lightweight AI Agent framework",
     long_description=Path("README.md").read_text(),
@@ -21,5 +21,5 @@ setup(
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
     ],
-    keywords="AI agents lightweight framework",
+    keywords="AI LLM Agentic AI AI Agents",
 )

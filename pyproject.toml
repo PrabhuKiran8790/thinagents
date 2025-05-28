@@ -1,12 +1,12 @@
 [project]
 name = "thinagents"
-version = "0.0.2"
+version = "0.0.3"
 description = "A lightweight AI Agent framework"
 authors = [{ name = "Prabhu Kiran Konda" }]
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-keywords = ["AI", "agents", "lightweight", "framework"]
+keywords = ["AI", "LLM", "Agentic AI", "AI Agents"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
