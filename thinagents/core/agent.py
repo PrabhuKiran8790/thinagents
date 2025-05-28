@@ -4,7 +4,8 @@ Module implementing the Agent class for orchestrating LLM interactions and tool 
 
 import json
 import logging
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union, Iterator, TypeVar, Generic, cast, overload, Literal
+import asyncio
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union, Iterator, AsyncIterator, TypeVar, Generic, cast, overload, Literal
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 import litellm
 from litellm import completion as litellm_completion
@@ -711,7 +712,7 @@ class Agent(Generic[_ExpectedContentType]):
                         
                     # Standard streaming choice
                     try:
-                        sc = chunk.choices[0]
+                        sc = chunk.choices[0]  # type: ignore
                         delta = getattr(sc, "delta", None)
                         finish_reason = getattr(sc, "finish_reason", None)
                         
@@ -968,3 +969,402 @@ class Agent(Generic[_ExpectedContentType]):
         repr_str += ")"
         
         return repr_str
+
+    async def _execute_tool_async(self, tool_name: str, tool_args: Dict) -> Any:
+        return await asyncio.to_thread(self._execute_tool, tool_name, tool_args)
+
+    async def _run_async(self, input: str) -> ThinagentResponse[_ExpectedContentType]:
+        self._tool_artifacts = {}
+        steps = 0
+        json_correction_attempts = 0
+        messages: List[Dict] = []
+
+        system_prompt = self._build_system_prompt()
+        messages.extend((
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": input},
+        ))
+
+        while steps < self.max_steps:
+            try:
+                response = await litellm.acompletion(
+                    model=self.model,
+                    messages=messages,
+                    api_key=self.api_key,
+                    api_base=self.api_base,
+                    api_version=self.api_version,
+                    tools=self.tool_schemas,
+                    parallel_tool_calls=self.parallel_tool_calls,
+                    response_format=self.response_format_model_type,
+                    **self.kwargs,
+                )
+            except Exception as e:
+                logger.error(f"LLM async completion failed: {e}")
+                raise AgentError(f"LLM async completion failed: {e}") from e
+
+            response_id = getattr(response, "id", None)
+            created_timestamp = getattr(response, "created", None)
+            model_used = getattr(response, "model", None)
+            system_fingerprint = getattr(response, "system_fingerprint", None)
+            metrics = self._extract_usage_metrics(response)
+
+            try:
+                if not hasattr(response, "choices") or not response.choices:  # type: ignore
+                    logger.error("Async response has no choices")
+                    raise AgentError("Invalid response structure: no choices")
+
+                finish_reason = response.choices[0].finish_reason  # type: ignore
+                message = response.choices[0].message  # type: ignore
+                tool_calls = getattr(message, "tool_calls", None) or []
+            except (IndexError, AttributeError) as e:
+                logger.error(f"Invalid async response structure: {e}")
+                raise AgentError(f"Invalid async response structure: {e}") from e
+
+            if finish_reason == "stop" and not tool_calls:
+                return self._handle_completion(
+                    message,
+                    response_id,
+                    created_timestamp,
+                    model_used,
+                    finish_reason,
+                    metrics,
+                    system_fingerprint,
+                    messages,
+                    json_correction_attempts,
+                )
+
+            if finish_reason == "tool_calls" or tool_calls:
+                await asyncio.to_thread(self._handle_tool_calls, tool_calls, message, messages)
+                steps += 1
+                continue
+
+            steps += 1
+
+        logger.warning(f"Agent '{self.name}' reached max steps ({self.max_steps}) in async mode")
+        raise MaxStepsExceededError(f"Max steps ({self.max_steps}) reached without final answer.")
+
+    async def _run_stream_async(
+        self,
+        input: str,
+        stream_intermediate_steps: bool = False,
+    ) -> AsyncIterator[ThinagentResponseStream[Any]]:
+        self._tool_artifacts = {}
+        logger.info(f"Agent '{self.name}' starting async streaming execution")
+
+        system_prompt = self._build_system_prompt()
+        messages: List[Dict] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": input},
+        ]
+
+        step_count = 0
+        while step_count < self.max_steps:
+            step_count += 1
+            call_name: Optional[str] = None
+            call_args: str = ""
+            call_id: Optional[str] = None
+            final_finish_reason: Optional[str] = None
+
+            try:
+                response = await litellm.acompletion(
+                    model=self.model,
+                    messages=messages,
+                    api_key=self.api_key,
+                    api_base=self.api_base,
+                    api_version=self.api_version,
+                    tools=self.tool_schemas,
+                    parallel_tool_calls=self.parallel_tool_calls,
+                    response_format=None,
+                    stream=True,
+                    **self.kwargs,
+                )
+
+                async for chunk in response:  # type: ignore
+                    if isinstance(chunk, tuple) and len(chunk) == 2:
+                        raw, opts = chunk
+                        yield ThinagentResponseStream(
+                            content=raw,
+                            content_type="str",
+                            tool_name=None,
+                            tool_call_id=None,
+                            response_id=None,
+                            created_timestamp=None,
+                            model_used=None,
+                            finish_reason=None,
+                            metrics=None,
+                            system_fingerprint=None,
+                            artifact=None,
+                            stream_options=opts,
+                        )
+                        continue
+
+                    try:
+                        sc = chunk.choices[0]  # type: ignore
+                        delta = getattr(sc, "delta", None)
+                        finish_reason = getattr(sc, "finish_reason", None)
+                        if finish_reason is not None:
+                            final_finish_reason = finish_reason
+                    except (IndexError, AttributeError):
+                        logger.warning("Invalid chunk structure in async stream")
+                        continue
+
+                    tool_calls = getattr(delta, "tool_calls", None)
+                    if tool_calls:
+                        for tc in tool_calls:
+                            if hasattr(tc, "function"):
+                                if tc.id:
+                                    call_id = tc.id
+                                if tc.function.name:
+                                    call_name = tc.function.name
+                                if tc.function.arguments:
+                                    call_args += tc.function.arguments
+                                    if stream_intermediate_steps:
+                                        yield ThinagentResponseStream(
+                                            content=tc.function.arguments,
+                                            content_type="tool_call_arg",
+                                            tool_name=tc.function.name,
+                                            tool_call_id=tc.id,
+                                            response_id=getattr(chunk, "id", None),
+                                            created_timestamp=getattr(chunk, "created", None),
+                                            model_used=getattr(chunk, "model", None),
+                                            finish_reason=final_finish_reason,
+                                            metrics=None,
+                                            system_fingerprint=getattr(chunk, "system_fingerprint", None),
+                                            artifact=None,
+                                            stream_options=None,
+                                        )
+
+                    fc = getattr(delta, "function_call", None)
+                    if fc is not None:
+                        if fc.name:
+                            call_name = fc.name
+                        if fc.arguments:
+                            call_args += fc.arguments
+                            if stream_intermediate_steps:
+                                yield ThinagentResponseStream(
+                                    content=fc.arguments,
+                                    content_type="tool_call_arg",
+                                    tool_name=fc.name if hasattr(fc, 'name') else call_name,
+                                    tool_call_id=call_id,
+                                    response_id=getattr(chunk, "id", None),
+                                    created_timestamp=getattr(chunk, "created", None),
+                                    model_used=getattr(chunk, "model", None),
+                                    finish_reason=final_finish_reason,
+                                    metrics=None,
+                                    system_fingerprint=getattr(chunk, "system_fingerprint", None),
+                                    artifact=None,
+                                    stream_options=None,
+                                )
+
+                    if finish_reason in ["tool_calls", "function_call"]:
+                        break
+
+                    text = getattr(delta, "content", None)
+                    if text:
+                        if self.granular_stream and len(text) > 1:
+                            for ch in text:
+                                yield ThinagentResponseStream(
+                                    content=ch,
+                                    content_type="str",
+                                    tool_name=None,
+                                    tool_call_id=None,
+                                    response_id=getattr(chunk, "id", None),
+                                    created_timestamp=getattr(chunk, "created", None),
+                                    model_used=getattr(chunk, "model", None),
+                                    finish_reason=final_finish_reason,
+                                    metrics=None,
+                                    system_fingerprint=getattr(chunk, "system_fingerprint", None),
+                                    artifact=None,
+                                    stream_options=None,
+                                )
+                            continue
+                        yield ThinagentResponseStream(
+                            content=text,
+                            content_type="str",
+                            tool_name=None,
+                            tool_call_id=None,
+                            response_id=getattr(chunk, "id", None),
+                            created_timestamp=getattr(chunk, "created", None),
+                            model_used=getattr(chunk, "model", None),
+                            finish_reason=final_finish_reason,
+                            metrics=None,
+                            system_fingerprint=getattr(chunk, "system_fingerprint", None),
+                            artifact=None,
+                            stream_options=None,
+                        )
+
+                    if finish_reason == "stop":
+                        logger.info(f"Agent '{self.name}' async streaming completed successfully")
+                        yield ThinagentResponseStream(
+                            content="",
+                            content_type="completion",
+                            tool_name=None,
+                            tool_call_id=None,
+                            response_id=getattr(chunk, "id", None),
+                            created_timestamp=getattr(chunk, "created", None),
+                            model_used=getattr(chunk, "model", None),
+                            finish_reason="stop",
+                            metrics=None,
+                            system_fingerprint=getattr(chunk, "system_fingerprint", None),
+                            artifact=None,
+                            stream_options=None,
+                        )
+                        return
+
+            except Exception as e:
+                logger.error(f"Async streaming error: {e}")
+                yield ThinagentResponseStream(
+                    content=f"Error: {e}",
+                    content_type="error",
+                    tool_name=None,
+                    tool_call_id=None,
+                    response_id=None,
+                    created_timestamp=None,
+                    model_used=None,
+                    finish_reason="error",
+                    metrics=None,
+                    system_fingerprint=None,
+                    artifact=None,
+                    stream_options=None,
+                )
+                return
+
+            if call_name:
+                if stream_intermediate_steps:
+                    yield ThinagentResponseStream(
+                        content=f"<tool_call:{call_name}>",
+                        content_type="tool_call",
+                        tool_name=call_name,
+                        tool_call_id=call_id or f"call_{call_name}",
+                        response_id=None,
+                        created_timestamp=None,
+                        model_used=None,
+                        finish_reason=final_finish_reason,
+                        metrics=None,
+                        system_fingerprint=None,
+                        artifact=None,
+                        stream_options=None,
+                    )
+
+                try:
+                    parsed_args = json.loads(call_args) if call_args else {}
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse tool arguments: {e}")
+                    parsed_args = {}
+
+                try:
+                    tool_result = await self._execute_tool_async(call_name, parsed_args)
+                except ToolExecutionError as e:
+                    logger.error(f"Tool execution failed in async stream: {e}")
+                    tool_result = {"error": str(e), "message": "Tool execution failed"}
+
+                tool_obj = self.tool_maps.get(call_name)
+                return_type = getattr(tool_obj, "return_type", "content")
+                artifact_payload = None
+                if return_type == "content_and_artifact" and isinstance(tool_result, tuple) and len(tool_result) == 2:
+                    content_value, artifact_payload = tool_result
+                    self._tool_artifacts[call_name] = artifact_payload
+                    serialised_content = self._process_tool_call_result(content_value)
+                else:
+                    serialised_content = self._process_tool_call_result(tool_result)
+
+                if stream_intermediate_steps:
+                    yield ThinagentResponseStream(
+                        content=serialised_content,
+                        content_type="tool_result",
+                        tool_name=call_name,
+                        tool_call_id=call_id or f"call_{call_name}",
+                        response_id=None,
+                        created_timestamp=None,
+                        model_used=None,
+                        finish_reason=final_finish_reason,
+                        metrics=None,
+                        system_fingerprint=None,
+                        artifact=self._tool_artifacts.copy() if self._tool_artifacts else None,
+                        stream_options=None,
+                    )
+
+                assistant_message = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": call_id or f"call_{call_name}",
+                            "type": "function",
+                            "function": {"name": call_name, "arguments": call_args},
+                        }
+                    ],
+                }
+                messages.append(assistant_message)
+
+                tool_message = {
+                    "role": "tool",
+                    "tool_call_id": call_id or f"call_{call_name}",
+                    "content": serialised_content,
+                }
+                messages.append(tool_message)
+
+                continue
+
+            break
+
+        logger.warning(f"Agent '{self.name}' reached max steps in async streaming mode")
+        yield ThinagentResponseStream(
+            content=f"Max steps ({self.max_steps}) reached",
+            content_type="error",
+            tool_name=None,
+            tool_call_id=None,
+            response_id=None,
+            created_timestamp=None,
+            model_used=None,
+            finish_reason="max_steps_reached",
+            metrics=None,
+            system_fingerprint=None,
+            artifact=None,
+            stream_options=None,
+        )
+
+    @overload
+    async def arun(
+        self,
+        input: str,
+        stream: Literal[False] = False,
+        stream_intermediate_steps: bool = False,
+    ) -> ThinagentResponse[_ExpectedContentType]: ...
+
+    @overload
+    async def arun(
+        self,
+        input: str,
+        stream: Literal[True],
+        stream_intermediate_steps: bool = False,
+    ) -> AsyncIterator[ThinagentResponseStream[Any]]: ...
+
+    async def arun(
+        self,
+        input: str,
+        stream: bool = False,
+        stream_intermediate_steps: bool = False,
+    ) -> Any:
+        if not input or not isinstance(input, str):
+            raise ValueError("Input must be a non-empty string")
+
+        logger.info(f"Agent '{self.name}' starting async execution with input length: {len(input)}")
+
+        if stream:
+            if self.response_format_model_type:
+                raise ValueError("Streaming is not supported when response_format is specified.")
+            return self._run_stream_async(input, stream_intermediate_steps)
+
+        return await self._run_async(input)
+
+    def astream(
+        self,
+        input: str,
+        *,
+        stream_intermediate_steps: bool = False,
+    ) -> AsyncIterator[ThinagentResponseStream[Any]]:
+
+        if self.response_format_model_type:
+            raise ValueError("Streaming is not supported when response_format is specified.")
+        return self._run_stream_async(input, stream_intermediate_steps)
