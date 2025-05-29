@@ -116,7 +116,6 @@ class Agent(Generic[_ExpectedContentType]):
         prompt: Optional[Union[str, PromptConfig]] = None,
         instructions: Optional[List[str]] = None,
         max_steps: int = DEFAULT_MAX_STEPS,
-        parallel_tool_calls: bool = False,
         concurrent_tool_execution: bool = True,
         response_format: Optional[Type[_ExpectedContentType]] = None,
         enable_schema_validation: bool = True,
@@ -177,7 +176,6 @@ class Agent(Generic[_ExpectedContentType]):
         if self.response_format_model_type:
             litellm.enable_json_schema_validation = self.enable_schema_validation
 
-        self.parallel_tool_calls = parallel_tool_calls
         self.concurrent_tool_execution = concurrent_tool_execution
         self.kwargs = kwargs
 
@@ -453,7 +451,6 @@ class Agent(Generic[_ExpectedContentType]):
                     api_base=self.api_base,
                     api_version=self.api_version,
                     tools=self.tool_schemas,
-                    parallel_tool_calls=self.parallel_tool_calls,
                     response_format=self.response_format_model_type,
                     **self.kwargs,
                 )
@@ -685,7 +682,6 @@ class Agent(Generic[_ExpectedContentType]):
                     api_base=self.api_base,
                     api_version=self.api_version,
                     tools=self.tool_schemas,
-                    parallel_tool_calls=self.parallel_tool_calls,
                     response_format=None,
                     stream=True,
                     **self.kwargs,
@@ -994,7 +990,6 @@ class Agent(Generic[_ExpectedContentType]):
                     api_base=self.api_base,
                     api_version=self.api_version,
                     tools=self.tool_schemas,
-                    parallel_tool_calls=self.parallel_tool_calls,
                     response_format=self.response_format_model_type,
                     **self.kwargs,
                 )
@@ -1073,7 +1068,6 @@ class Agent(Generic[_ExpectedContentType]):
                     api_base=self.api_base,
                     api_version=self.api_version,
                     tools=self.tool_schemas,
-                    parallel_tool_calls=self.parallel_tool_calls,
                     response_format=None,
                     stream=True,
                     **self.kwargs,
