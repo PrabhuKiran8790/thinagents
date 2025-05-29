@@ -11,6 +11,7 @@ import litellm
 from litellm import completion as litellm_completion
 from pydantic import BaseModel, ValidationError # type: ignore
 from thinagents.core.tool import ThinAgentsTool, tool as tool_decorator
+from thinagents.core.memory import BaseMemory, ConversationInfo
 from thinagents.utils.prompts import PromptConfig
 from thinagents.core.response_models import (
     ThinagentResponse,
@@ -121,6 +122,7 @@ class Agent(Generic[_ExpectedContentType]):
         enable_schema_validation: bool = True,
         description: Optional[str] = None,
         tool_timeout: float = DEFAULT_TOOL_TIMEOUT,
+        memory: Optional[BaseMemory] = None,
         **kwargs,
     ):
         """
@@ -155,6 +157,10 @@ class Agent(Generic[_ExpectedContentType]):
                 Defaults to True.
             description: Optional description for the agent.
             tool_timeout: Timeout in seconds for tool execution. Defaults to 30.0.
+            memory: Optional BaseMemory instance for storing conversation history and context.
+                When provided, the agent will automatically manage conversation history across
+                multiple run() calls using conversation_id parameter. Use InMemoryStore with
+                store_tool_artifacts=True to also store tool artifacts alongside conversation history.
             **kwargs: Additional keyword arguments that will be passed directly to the `litellm.completion` function.
         """
         _validate_agent_config(name, model, max_steps)
@@ -186,6 +192,9 @@ class Agent(Generic[_ExpectedContentType]):
 
         # Initialize tools and sub-agents
         self._initialize_tools()
+
+        # Initialize memory-related attributes
+        self.memory = memory
 
     def _initialize_tools(self) -> None:
         """Initialize tools and sub-agents."""
@@ -349,6 +358,68 @@ class Agent(Generic[_ExpectedContentType]):
         messages.append({"role": "user", "content": correction_prompt})
         return True
 
+    def _serialize_tool_calls(self, tool_calls: List[Any]) -> List[Dict[str, Any]]:
+        """
+        Convert tool call objects to JSON-serializable dictionaries.
+        
+        Args:
+            tool_calls: List of tool call objects from LLM response
+            
+        Returns:
+            List of serializable tool call dictionaries
+        """
+        serialized_calls = []
+        
+        for tc in tool_calls:
+            try:
+                # Handle both modern tool_calls format and legacy function_call
+                if hasattr(tc, 'function') and hasattr(tc, 'id'):
+                    # Modern tool_calls format
+                    serialized_call = {
+                        "id": tc.id,
+                        "type": getattr(tc, "type", "function"),
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments
+                        }
+                    }
+                elif hasattr(tc, 'name') and hasattr(tc, 'arguments'):
+                    # Legacy function_call format
+                    serialized_call = {
+                        "id": getattr(tc, "id", f"call_{tc.name}"),
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments
+                        }
+                    }
+                else:
+                    # Fallback - try to extract what we can
+                    serialized_call = {
+                        "id": getattr(tc, "id", f"call_{getattr(tc, 'name', 'unknown')}"),
+                        "type": "function",
+                        "function": {
+                            "name": getattr(tc, "name", "unknown"),
+                            "arguments": getattr(tc, "arguments", "{}")
+                        }
+                    }
+                
+                serialized_calls.append(serialized_call)
+                
+            except Exception as e:
+                logger.warning(f"Failed to serialize tool call {tc}: {e}")
+                # Add a fallback entry to maintain structure
+                serialized_calls.append({
+                    "id": "unknown_call",
+                    "type": "function", 
+                    "function": {
+                        "name": "unknown",
+                        "arguments": "{}"
+                    }
+                })
+        
+        return serialized_calls
+
     def _process_tool_call_result(self, tool_call_result: Any) -> str:
         """Process tool call result and convert to string for LLM."""
         try:
@@ -377,6 +448,7 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         stream: Literal[False] = False,
         stream_intermediate_steps: bool = False,
+        conversation_id: Optional[str] = None,
     ) -> ThinagentResponse[_ExpectedContentType]:
         ...
     @overload
@@ -385,6 +457,7 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         stream: Literal[True],
         stream_intermediate_steps: bool = False,
+        conversation_id: Optional[str] = None,
     ) -> Iterator[ThinagentResponseStream[Any]]:
         ...
     def run(
@@ -392,6 +465,7 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         stream: bool = False,
         stream_intermediate_steps: bool = False,
+        conversation_id: Optional[str] = None,
     ) -> Any:
         """
         Run the agent with the given input and manage interactions with the language model and tools.
@@ -400,6 +474,7 @@ class Agent(Generic[_ExpectedContentType]):
             input: The user's input message to the agent.
             stream: If True, returns a stream of responses instead of a single response.
             stream_intermediate_steps: If True and stream=True, also stream intermediate tool calls and results.
+            conversation_id: Optional conversation ID for memory retrieval
 
         Returns:
             ThinagentResponse[_ExpectedContentType] when stream=False, or Iterator[ThinagentResponseStream] when stream=True.
@@ -417,31 +492,26 @@ class Agent(Generic[_ExpectedContentType]):
         if stream:
             if self.response_format_model_type:
                 raise ValueError("Streaming is not supported when response_format is specified.")
-            return self._run_stream(input, stream_intermediate_steps)
+            return self._run_stream(input, stream_intermediate_steps, conversation_id)
 
         try:
-            return self._run_sync(input)
+            return self._run_sync(input, conversation_id)
         except Exception as e:
             logger.error(f"Agent '{self.name}' execution failed: {e}")
             if isinstance(e, (AgentError, MaxStepsExceededError)):
                 raise
             raise AgentError(f"Agent execution failed: {e}") from e
 
-    def _run_sync(self, input: str) -> ThinagentResponse[_ExpectedContentType]:
+    def _run_sync(self, input: str, conversation_id: Optional[str] = None) -> ThinagentResponse[_ExpectedContentType]:
         """Synchronous execution of the agent."""
         # initialize storage for tool artifacts
         self._tool_artifacts: dict[str, Any] = {}
         steps = 0
         json_correction_attempts = 0
-        messages: List[Dict] = []
 
-        system_prompt = self._build_system_prompt()
-        messages.extend(
-            (
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": input},
-            )
-        )
+        # Build messages with memory support
+        messages = self._build_messages_with_memory(input, conversation_id)
+
         while steps < self.max_steps:
             try:
                 response = litellm_completion(
@@ -483,12 +553,12 @@ class Agent(Generic[_ExpectedContentType]):
                 return self._handle_completion(
                     message, response_id, created_timestamp, model_used, 
                     finish_reason, metrics, system_fingerprint, messages, 
-                    json_correction_attempts
+                    json_correction_attempts, conversation_id
                 )
 
             # Handle tool calls
             if finish_reason == "tool_calls" or tool_calls:
-                self._handle_tool_calls(tool_calls, message, messages)
+                self._handle_tool_calls(tool_calls, message, messages, conversation_id)
                 steps += 1
                 continue
 
@@ -508,7 +578,8 @@ class Agent(Generic[_ExpectedContentType]):
         metrics: Optional[UsageMetrics],
         system_fingerprint: Optional[str],
         messages: List[Dict],
-        json_correction_attempts: int
+        json_correction_attempts: int,
+        conversation_id: Optional[str] = None,
     ) -> ThinagentResponse[_ExpectedContentType]:
         """Handle completion response without tool calls."""
         raw_content_from_llm = message.content
@@ -520,13 +591,22 @@ class Agent(Generic[_ExpectedContentType]):
                 content_type_to_return = self.response_format_model_type.__name__
             except (ValidationError, json.JSONDecodeError) as e:
                 if self._handle_json_correction(messages, raw_content_from_llm, e, json_correction_attempts):
-                    return self._run_sync(messages[-1]["content"])
+                    return self._run_sync(messages[-1]["content"], conversation_id)
                 # Max attempts reached, return error
                 final_content = cast(_ExpectedContentType, f"JSON validation failed after {MAX_JSON_CORRECTION_ATTEMPTS} attempts: {e}")
                 content_type_to_return = "str"
         else:
             final_content = cast(_ExpectedContentType, raw_content_from_llm)
             content_type_to_return = "str"
+
+        assistant_response_message = {"role": "assistant", "content": raw_content_from_llm}
+        messages.append(assistant_response_message)
+
+        if conversation_id is not None and self.memory is not None:
+            try:
+                self._save_messages_to_memory(messages, conversation_id)
+            except Exception as e:
+                logger.warning(f"An unexpected error occurred when calling _save_messages_to_memory from _handle_completion for conversation '{conversation_id}': {e}")
 
         return ThinagentResponse(
             content=final_content,
@@ -542,7 +622,7 @@ class Agent(Generic[_ExpectedContentType]):
             tool_call_id=None,
         )
 
-    def _handle_tool_calls(self, tool_calls: List[Any], message: Any, messages: List[Dict]) -> None:
+    def _handle_tool_calls(self, tool_calls: List[Any], message: Any, messages: List[Dict], conversation_id: Optional[str] = None) -> None:
         """Handle tool calls execution."""
         tool_call_outputs = []
         
@@ -550,7 +630,6 @@ class Agent(Generic[_ExpectedContentType]):
             def _process_individual_tool_call(tc: Any) -> Dict[str, Any]:
                 tool_call_name = tc.function.name
                 tool_call_id = tc.id
-                # check if tool returns artifact
                 tool = self.tool_maps.get(tool_call_name)
                 return_type = getattr(tool, "return_type", "content")
                 
@@ -570,20 +649,27 @@ class Agent(Generic[_ExpectedContentType]):
                 
                 try:
                     raw_result = self._execute_tool(tool_call_name, tool_call_args)
-                    # unpack content and artifact if provided
                     if return_type == "content_and_artifact" and isinstance(raw_result, tuple) and len(raw_result) == 2:
                         content_value, artifact = raw_result
                         self._tool_artifacts[tool_call_name] = artifact
                     else:
                         content_value = raw_result
+                        artifact = None
+                    
                     content_for_llm = self._process_tool_call_result(content_value)
                     
-                    return {
+                    tool_message = {
                         "tool_call_id": tool_call_id,
                         "role": "tool",
                         "name": tool_call_name,
                         "content": content_for_llm,
                     }
+                    
+                    if self._should_include_artifacts_in_messages() and artifact is not None:
+                        tool_message["artifact"] = artifact
+                    
+                    return tool_message
+                    
                 except ToolExecutionError as e:
                     logger.error(f"Tool execution error for {tool_call_name} (ID: {tool_call_id}): {e}")
                     return {
@@ -596,7 +682,6 @@ class Agent(Generic[_ExpectedContentType]):
                         }),
                     }
 
-            # Execute tool calls (concurrent or sequential)
             if self.concurrent_tool_execution and len(tool_calls) > 1:
                 with ThreadPoolExecutor(max_workers=len(tool_calls)) as executor:
                     futures = {
@@ -623,20 +708,14 @@ class Agent(Generic[_ExpectedContentType]):
                 for tc in tool_calls:
                     tool_call_outputs.append(_process_individual_tool_call(tc))
 
-        # Add assistant message and tool outputs to conversation
         try:
-            if hasattr(message, "__dict__"):
-                msg_dict = dict(message.__dict__)
-                msg_dict = {k: v for k, v in msg_dict.items() if not k.startswith("_")}
-                if "role" not in msg_dict and hasattr(message, "role"):
-                    msg_dict["role"] = message.role
-                if "content" not in msg_dict and hasattr(message, "content"):
-                    msg_dict["content"] = message.content
-            else:
-                msg_dict = {
-                    "role": getattr(message, "role", "assistant"),
-                    "content": getattr(message, "content", ""),
-                }
+            msg_dict = {
+                "role": getattr(message, "role", "assistant"),
+                "content": getattr(message, "content", None),
+            }
+            
+            if tool_calls and isinstance(tool_calls, list):
+                msg_dict["tool_calls"] = self._serialize_tool_calls(tool_calls)
 
             messages.append(msg_dict)
             messages.extend(tool_call_outputs)
@@ -644,37 +723,43 @@ class Agent(Generic[_ExpectedContentType]):
             logger.error(f"Failed to add messages to conversation: {e}")
             raise AgentError(f"Failed to add messages to conversation: {e}") from e
 
+        if conversation_id and self.memory:
+            self._save_messages_to_memory(messages, conversation_id)
+
+    def _should_include_artifacts_in_messages(self) -> bool:
+        """Check if the memory backend supports including artifacts in messages."""
+        if not self.memory:
+            return False
+        
+        from thinagents.core.memory import InMemoryStore
+        return isinstance(self.memory, InMemoryStore) and self.memory.store_tool_artifacts
+
     def _run_stream(
         self,
         input: str,
         stream_intermediate_steps: bool = False,
+        conversation_id: Optional[str] = None,
     ) -> Iterator[ThinagentResponseStream[Any]]:
         """
         Streamed version of run; yields ThinagentResponseStream chunks, including interleaved tool calls/results if requested.
         """
-        # initialise storage for tool artifacts for this run
         self._tool_artifacts = {}
         logger.info(f"Agent '{self.name}' starting streaming execution")
         
-        # Build initial messages
-        system_prompt = self._build_system_prompt()
-        messages: List[Dict] = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": input},
-        ]
+        messages: List[Dict[str, Any]] = self._build_messages_with_memory(input, conversation_id)
         
         step_count = 0
+        accumulated_content = ""
+        
         while step_count < self.max_steps:
             step_count += 1
             
-            # Accumulate function call args across deltas
             call_name: Optional[str] = None
             call_args: str = ""
             call_id: Optional[str] = None
             final_finish_reason: Optional[str] = None
             
-            try:
-                # Stream chat until a function call is completed or done
+            try:    
                 for chunk in litellm_completion(
                     model=self.model,
                     messages=messages,
@@ -687,7 +772,6 @@ class Agent(Generic[_ExpectedContentType]):
                     **self.kwargs,
                 ):
                     
-                    # Raw tuple from custom streams
                     if isinstance(chunk, tuple) and len(chunk) == 2:
                         raw, opts = chunk
                         yield ThinagentResponseStream(
@@ -706,13 +790,11 @@ class Agent(Generic[_ExpectedContentType]):
                         )
                         continue
                         
-                    # Standard streaming choice
                     try:
                         sc = chunk.choices[0]  # type: ignore
                         delta = getattr(sc, "delta", None)
                         finish_reason = getattr(sc, "finish_reason", None)
                         
-                        # Track the final finish reason when it appears
                         if finish_reason is not None:
                             final_finish_reason = finish_reason
                             
@@ -720,7 +802,6 @@ class Agent(Generic[_ExpectedContentType]):
                         logger.warning("Invalid chunk structure in stream")
                         continue
                     
-                    # Handle tool_calls (modern format)
                     tool_calls = getattr(delta, "tool_calls", None)
                     if tool_calls:
                         for tc in tool_calls:
@@ -747,7 +828,6 @@ class Agent(Generic[_ExpectedContentType]):
                                             stream_options=None,
                                         )
                     
-                    # Handle function_call (legacy format)
                     fc = getattr(delta, "function_call", None)
                     if fc is not None:
                         if fc.name:
@@ -777,6 +857,7 @@ class Agent(Generic[_ExpectedContentType]):
                     # Otherwise, stream content tokens
                     text = getattr(delta, "content", None)
                     if text:
+                        accumulated_content += text  # Accumulate content
                         if self.granular_stream and len(text) > 1:
                             for ch in text:
                                 yield ThinagentResponseStream(
@@ -811,6 +892,13 @@ class Agent(Generic[_ExpectedContentType]):
                         
                     # Check for completion without tool calls
                     if finish_reason == "stop":
+                        # Save accumulated content to memory if available
+                        if conversation_id and self.memory and accumulated_content:
+                            final_assistant_message = {"role": "assistant", "content": accumulated_content}
+                            messages.append(final_assistant_message)
+                            self._save_messages_to_memory(messages, conversation_id)
+                            logger.info(f"Saved final streaming response to memory for conversation '{conversation_id}'")
+                            
                         logger.info(f"Agent '{self.name}' streaming completed successfully")
                         # Emit a final completion chunk to signal the end
                         yield ThinagentResponseStream(
@@ -847,9 +935,7 @@ class Agent(Generic[_ExpectedContentType]):
                 )
                 return
             
-            # If a function call was made, execute and loop again
             if call_name:
-                # Optionally emit tool call event
                 if stream_intermediate_steps:
                     yield ThinagentResponseStream(
                         content=f"<tool_call:{call_name}>",
@@ -908,7 +994,7 @@ class Agent(Generic[_ExpectedContentType]):
                     )
                 
                 # Add assistant message with tool_calls structure
-                assistant_message = {
+                assistant_message: Dict[str, Any] = {
                     "role": "assistant",
                     "content": None,
                     "tool_calls": [
@@ -924,13 +1010,21 @@ class Agent(Generic[_ExpectedContentType]):
                 }
                 messages.append(assistant_message)
                 
-                # Append the tool response
-                tool_message = {
+                # Append the tool response with artifact if applicable
+                tool_message: Dict[str, Any] = {
                     "role": "tool",
                     "tool_call_id": call_id or f"call_{call_name}",
                     "content": serialised_content,
                 }
+                
+                # Include artifact in tool message if memory supports it and artifacts are available
+                if self._should_include_artifacts_in_messages() and artifact_payload is not None:
+                    tool_message["artifact"] = artifact_payload
+                
                 messages.append(tool_message)
+                if self.memory and conversation_id:
+                    self._save_messages_to_memory(messages, conversation_id)
+
                 
                 continue
             
@@ -969,17 +1063,13 @@ class Agent(Generic[_ExpectedContentType]):
     async def _execute_tool_async(self, tool_name: str, tool_args: Dict) -> Any:
         return await asyncio.to_thread(self._execute_tool, tool_name, tool_args)
 
-    async def _run_async(self, input: str) -> ThinagentResponse[_ExpectedContentType]:
+    async def _run_async(self, input: str, conversation_id: Optional[str] = None) -> ThinagentResponse[_ExpectedContentType]:
         self._tool_artifacts = {}
         steps = 0
         json_correction_attempts = 0
-        messages: List[Dict] = []
-
-        system_prompt = self._build_system_prompt()
-        messages.extend((
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": input},
-        ))
+        
+        # Build messages with memory support
+        messages = self._build_messages_with_memory(input, conversation_id)
 
         while steps < self.max_steps:
             try:
@@ -1026,10 +1116,11 @@ class Agent(Generic[_ExpectedContentType]):
                     system_fingerprint,
                     messages,
                     json_correction_attempts,
+                    conversation_id
                 )
 
             if finish_reason == "tool_calls" or tool_calls:
-                await asyncio.to_thread(self._handle_tool_calls, tool_calls, message, messages)
+                await asyncio.to_thread(self._handle_tool_calls, tool_calls, message, messages, conversation_id)
                 steps += 1
                 continue
 
@@ -1042,15 +1133,14 @@ class Agent(Generic[_ExpectedContentType]):
         self,
         input: str,
         stream_intermediate_steps: bool = False,
+        conversation_id: Optional[str] = None,
     ) -> AsyncIterator[ThinagentResponseStream[Any]]:
         self._tool_artifacts = {}
         logger.info(f"Agent '{self.name}' starting async streaming execution")
 
-        system_prompt = self._build_system_prompt()
-        messages: List[Dict] = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": input},
-        ]
+        # Build messages with memory support
+        messages = self._build_messages_with_memory(input, conversation_id)
+        accumulated_content = ""  # Track accumulated content for memory
 
         step_count = 0
         while step_count < self.max_steps:
@@ -1155,6 +1245,7 @@ class Agent(Generic[_ExpectedContentType]):
 
                     text = getattr(delta, "content", None)
                     if text:
+                        accumulated_content += text  # Accumulate content
                         if self.granular_stream and len(text) > 1:
                             for ch in text:
                                 yield ThinagentResponseStream(
@@ -1188,6 +1279,13 @@ class Agent(Generic[_ExpectedContentType]):
                         )
 
                     if finish_reason == "stop":
+                        # Save accumulated content to memory if available
+                        if conversation_id and self.memory and accumulated_content:
+                            final_assistant_message = {"role": "assistant", "content": accumulated_content}
+                            messages.append(final_assistant_message)
+                            self._save_messages_to_memory(messages, conversation_id)
+                            logger.info(f"Saved final streaming response to memory for conversation '{conversation_id}'")
+                            
                         logger.info(f"Agent '{self.name}' async streaming completed successfully")
                         yield ThinagentResponseStream(
                             content="",
@@ -1278,24 +1376,33 @@ class Agent(Generic[_ExpectedContentType]):
                         stream_options=None,
                     )
 
-                assistant_message = {
+                assistant_message: Dict[str, Any] = {
                     "role": "assistant",
                     "content": None,
                     "tool_calls": [
                         {
                             "id": call_id or f"call_{call_name}",
                             "type": "function",
-                            "function": {"name": call_name, "arguments": call_args},
+                            "function": {
+                                "name": call_name,
+                                "arguments": call_args
+                            }
                         }
-                    ],
+                    ]
                 }
+                
                 messages.append(assistant_message)
 
-                tool_message = {
+                tool_message: Dict[str, Any] = {
                     "role": "tool",
                     "tool_call_id": call_id or f"call_{call_name}",
                     "content": serialised_content,
                 }
+                
+                # Include artifact in tool message if memory supports it and artifacts are available
+                if self._should_include_artifacts_in_messages() and artifact_payload is not None:
+                    tool_message["artifact"] = artifact_payload
+                
                 messages.append(tool_message)
 
                 continue
@@ -1324,6 +1431,7 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         stream: Literal[False] = False,
         stream_intermediate_steps: bool = False,
+        conversation_id: Optional[str] = None,
     ) -> ThinagentResponse[_ExpectedContentType]: ...
 
     @overload
@@ -1332,6 +1440,7 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         stream: Literal[True],
         stream_intermediate_steps: bool = False,
+        conversation_id: Optional[str] = None,
     ) -> AsyncIterator[ThinagentResponseStream[Any]]: ...
 
     async def arun(
@@ -1339,6 +1448,7 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         stream: bool = False,
         stream_intermediate_steps: bool = False,
+        conversation_id: Optional[str] = None,
     ) -> Any:
         if not input or not isinstance(input, str):
             raise ValueError("Input must be a non-empty string")
@@ -1348,17 +1458,175 @@ class Agent(Generic[_ExpectedContentType]):
         if stream:
             if self.response_format_model_type:
                 raise ValueError("Streaming is not supported when response_format is specified.")
-            return self._run_stream_async(input, stream_intermediate_steps)
+            return self._run_stream_async(input, stream_intermediate_steps, conversation_id)
 
-        return await self._run_async(input)
+        return await self._run_async(input, conversation_id)
 
     def astream(
         self,
         input: str,
         *,
         stream_intermediate_steps: bool = False,
+        conversation_id: Optional[str] = None,
     ) -> AsyncIterator[ThinagentResponseStream[Any]]:
 
         if self.response_format_model_type:
             raise ValueError("Streaming is not supported when response_format is specified.")
-        return self._run_stream_async(input, stream_intermediate_steps)
+        return self._run_stream_async(input, stream_intermediate_steps, conversation_id)
+
+    def _build_messages_with_memory(self, input: str, conversation_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Build messages list including memory history if available.
+        
+        Args:
+            input: Current user input
+            conversation_id: Optional conversation ID for memory retrieval
+            
+        Returns:
+            List of messages including system prompt, history, and current input
+        """
+        messages: List[Dict[str, Any]] = []
+        
+        # Add system prompt
+        system_prompt = self._build_system_prompt()
+        messages.append({"role": "system", "content": system_prompt})
+        
+        # Add conversation history from memory if available
+        if self.memory and conversation_id:
+            try:
+                history = self.memory.get_messages(conversation_id)
+                # Filter out system messages from history to avoid duplication
+                # Also remove artifacts from tool messages since LLM doesn't need them
+                filtered_history = []
+                for msg in history:
+                    if msg.get("role") == "system":
+                        continue  # Skip system messages
+                    
+                    # Create a copy of the message for LLM
+                    llm_message = msg.copy()
+                    
+                    # Remove artifacts from tool messages - LLM doesn't need them
+                    if msg.get("role") == "tool" and "artifact" in llm_message:
+                        del llm_message["artifact"]
+                    
+                    filtered_history.append(llm_message)
+                
+                messages.extend(filtered_history)
+                logger.debug(f"Added {len(filtered_history)} messages from memory for conversation '{conversation_id}' (artifacts filtered out)")
+            except Exception as e:
+                logger.warning(f"Failed to retrieve memory for conversation '{conversation_id}': {e}")
+        
+        # Add current user input
+        messages.append({"role": "user", "content": input})
+        
+        return messages
+
+    def _save_messages_to_memory(self, messages: List[Dict], conversation_id: str) -> None:
+        """
+        Save new messages to memory, excluding system messages and existing history.
+        
+        Args:
+            messages: List of all messages from the conversation
+            conversation_id: Conversation ID for memory storage
+        """
+        if not self.memory:
+            return
+            
+        try:
+            # Get existing message count to determine which messages are new
+            existing_count = self.memory.get_conversation_length(conversation_id)
+            
+            # Filter out system messages and get only new messages
+            non_system_messages = [msg for msg in messages if msg.get("role") != "system"]
+            new_messages = non_system_messages[existing_count:]
+            
+            # Save new messages to memory
+            for message in new_messages:
+                self.memory.add_message(conversation_id, message)
+                
+            if new_messages:
+                logger.debug(f"Saved {len(new_messages)} new messages to memory for conversation '{conversation_id}'")
+        except Exception as e:
+            logger.warning(f"Failed to save messages to memory for conversation '{conversation_id}': {e}")
+
+    def clear_memory(self, conversation_id: str) -> None:
+        """
+        Clear memory for a specific conversation.
+        
+        Args:
+            conversation_id: Conversation ID to clear
+            
+        Raises:
+            ValueError: If no memory backend is configured
+        """
+        if not self.memory:
+            raise ValueError("No memory backend configured for this agent")
+        
+        self.memory.clear_conversation(conversation_id)
+        logger.info(f"Cleared memory for conversation '{conversation_id}'")
+
+    def get_conversation_history(self, conversation_id: str) -> List[Dict[str, Any]]:
+        """
+        Get conversation history for a specific conversation.
+        
+        Args:
+            conversation_id: Conversation ID to retrieve
+            
+        Returns:
+            List of message dictionaries
+            
+        Raises:
+            ValueError: If no memory backend is configured
+        """
+        if not self.memory:
+            raise ValueError("No memory backend configured for this agent")
+        
+        return self.memory.get_messages(conversation_id)
+
+    def list_conversations(self) -> List[ConversationInfo]:
+        """
+        List all conversations with detailed metadata.
+        
+        Returns:
+            List of conversation info dictionaries with metadata
+            
+        Raises:
+            ValueError: If no memory backend is configured
+        """
+        if not self.memory:
+            raise ValueError("No memory backend configured for this agent")
+        
+        return self.memory.list_conversations()
+
+    def list_conversation_ids(self) -> List[str]:
+        """
+        List all conversation IDs in memory.
+        
+        Returns:
+            List of conversation IDs as strings
+            
+        Raises:
+            ValueError: If no memory backend is configured
+        """
+        if not self.memory:
+            raise ValueError("No memory backend configured for this agent")
+        
+        return self.memory.list_conversation_ids()
+
+    def get_conversation_info(self, conversation_id: str) -> Optional[ConversationInfo]:
+        """
+        Get detailed information about a specific conversation.
+        
+        Args:
+            conversation_id: Conversation ID to retrieve info for
+            
+        Returns:
+            ConversationInfo dictionary or None if conversation doesn't exist
+            
+        Raises:
+            ValueError: If no memory backend is configured
+        """
+        if not self.memory:
+            raise ValueError("No memory backend configured for this agent")
+        
+        return self.memory.get_conversation_info(conversation_id)
