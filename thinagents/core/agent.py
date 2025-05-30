@@ -11,7 +11,7 @@ import litellm
 from litellm import completion as litellm_completion
 from pydantic import BaseModel, ValidationError # type: ignore
 from thinagents.core.tool import ThinAgentsTool, tool as tool_decorator
-from thinagents.core.memory import BaseMemory, ConversationInfo
+from thinagents.memory import BaseMemory, ConversationInfo
 from thinagents.utils.prompts import PromptConfig
 from thinagents.core.response_models import (
     ThinagentResponse,
@@ -187,8 +187,8 @@ class Agent(Generic[_ExpectedContentType]):
 
         self._provided_tools = tools or []
 
-        # Whether to emit per-character ThinagentResponseStream chunks when streaming
         self.granular_stream = True
+        """Whether to emit per-character ThinagentResponseStream chunks when streaming"""
 
         # Initialize tools and sub-agents
         self._initialize_tools()
@@ -442,6 +442,58 @@ class Agent(Generic[_ExpectedContentType]):
             logger.warning(f"Failed to serialize tool result: {e}")
             return str(tool_call_result)
 
+    def _execute_single_tool_call(self, tc: Any) -> Dict[str, Any]:
+        # sourcery skip: extract-method
+        """Parse, execute, and format a single tool call."""
+        tool_call_name = tc.function.name
+        tool_call_id = tc.id
+        tool = self.tool_maps.get(tool_call_name)
+        return_type = getattr(tool, "return_type", "content")
+        try:
+            tool_call_args = json.loads(tc.function.arguments)
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing tool arguments for {tool_call_name} (ID: {tool_call_id}): {e}")
+            return {
+                "tool_call_id": tool_call_id,
+                "role": "tool",
+                "name": tool_call_name,
+                "content": json.dumps({
+                    "error": str(e),
+                    "message": "Failed to parse arguments",
+                }),
+            }
+
+        try:
+            raw_result = self._execute_tool(tool_call_name, tool_call_args)
+            if return_type == "content_and_artifact" and isinstance(raw_result, tuple) and len(raw_result) == 2:
+                content_value, artifact = raw_result
+                self._tool_artifacts[tool_call_name] = artifact
+            else:
+                content_value = raw_result
+                artifact = None
+
+            content_for_llm = self._process_tool_call_result(content_value)
+            tool_message = {
+                "tool_call_id": tool_call_id,
+                "role": "tool",
+                "name": tool_call_name,
+                "content": content_for_llm,
+            }
+            if self._should_include_artifacts_in_messages() and artifact is not None:
+                tool_message["artifact"] = artifact
+            return tool_message
+        except ToolExecutionError as e:
+            logger.error(f"Tool execution error for {tool_call_name} (ID: {tool_call_id}): {e}")
+            return {
+                "tool_call_id": tool_call_id,
+                "role": "tool",
+                "name": tool_call_name,
+                "content": json.dumps({
+                    "error": str(e),
+                    "message": "Tool execution failed",
+                }),
+            }
+
     @overload
     def run(
         self,
@@ -502,16 +554,10 @@ class Agent(Generic[_ExpectedContentType]):
                 raise
             raise AgentError(f"Agent execution failed: {e}") from e
 
-    def _run_sync(self, input: str, conversation_id: Optional[str] = None) -> ThinagentResponse[_ExpectedContentType]:
-        """Synchronous execution of the agent."""
-        # initialize storage for tool artifacts
-        self._tool_artifacts: dict[str, Any] = {}
+    def _run_loop(self, messages: List[Dict[str, Any]], conversation_id: Optional[str] = None) -> ThinagentResponse[_ExpectedContentType]:
+        """Shared synchronous step loop."""
         steps = 0
         json_correction_attempts = 0
-
-        # Build messages with memory support
-        messages = self._build_messages_with_memory(input, conversation_id)
-
         while steps < self.max_steps:
             try:
                 response = litellm_completion(
@@ -528,35 +574,29 @@ class Agent(Generic[_ExpectedContentType]):
                 logger.error(f"LLM completion failed: {e}")
                 raise AgentError(f"LLM completion failed: {e}") from e
 
-            # Extract response metadata
             response_id = getattr(response, "id", None)
             created_timestamp = getattr(response, "created", None)
             model_used = getattr(response, "model", None)
             system_fingerprint = getattr(response, "system_fingerprint", None)
             metrics = self._extract_usage_metrics(response)
 
-            # Process response
             try:
-                if not hasattr(response, 'choices') or not response.choices: # type: ignore
+                if not hasattr(response, 'choices') or not response.choices:  # type: ignore
                     logger.error("Response has no choices")
                     raise AgentError("Invalid response structure: no choices")
-
-                finish_reason = response.choices[0].finish_reason # type: ignore
-                message = response.choices[0].message # type: ignore
+                finish_reason = response.choices[0].finish_reason  # type: ignore
+                message = response.choices[0].message  # type: ignore
                 tool_calls = getattr(message, "tool_calls", None) or []
             except (IndexError, AttributeError) as e:
                 logger.error(f"Invalid response structure: {e}")
                 raise AgentError(f"Invalid response structure: {e}") from e
 
-            # Handle completion without tool calls
             if finish_reason == "stop" and not tool_calls:
                 return self._handle_completion(
-                    message, response_id, created_timestamp, model_used, 
-                    finish_reason, metrics, system_fingerprint, messages, 
+                    message, response_id, created_timestamp, model_used,
+                    finish_reason, metrics, system_fingerprint, messages,
                     json_correction_attempts, conversation_id
                 )
-
-            # Handle tool calls
             if finish_reason == "tool_calls" or tool_calls:
                 self._handle_tool_calls(tool_calls, message, messages, conversation_id)
                 steps += 1
@@ -564,9 +604,14 @@ class Agent(Generic[_ExpectedContentType]):
 
             steps += 1
 
-        # Max steps reached
         logger.warning(f"Agent '{self.name}' reached max steps ({self.max_steps})")
         raise MaxStepsExceededError(f"Max steps ({self.max_steps}) reached without final answer.")
+
+    def _run_sync(self, input: str, conversation_id: Optional[str] = None) -> ThinagentResponse[_ExpectedContentType]:
+        """Synchronous execution of the agent."""
+        self._tool_artifacts: dict[str, Any] = {}  # initialize storage for tool artifacts
+        messages = self._build_messages_with_memory(input, conversation_id)
+        return self._run_loop(messages, conversation_id)
 
     def _handle_completion(
         self, 
@@ -625,67 +670,12 @@ class Agent(Generic[_ExpectedContentType]):
     def _handle_tool_calls(self, tool_calls: List[Any], message: Any, messages: List[Dict], conversation_id: Optional[str] = None) -> None:
         """Handle tool calls execution."""
         tool_call_outputs = []
-        
-        if tool_calls:
-            def _process_individual_tool_call(tc: Any) -> Dict[str, Any]:
-                tool_call_name = tc.function.name
-                tool_call_id = tc.id
-                tool = self.tool_maps.get(tool_call_name)
-                return_type = getattr(tool, "return_type", "content")
-                
-                try:
-                    tool_call_args = json.loads(tc.function.arguments)
-                except json.JSONDecodeError as e:
-                    logger.error(f"Error parsing tool arguments for {tool_call_name} (ID: {tool_call_id}): {e}")
-                    return {
-                        "tool_call_id": tool_call_id,
-                        "role": "tool",
-                        "name": tool_call_name,
-                        "content": json.dumps({
-                            "error": str(e),
-                            "message": "Failed to parse arguments",
-                        }),
-                    }
-                
-                try:
-                    raw_result = self._execute_tool(tool_call_name, tool_call_args)
-                    if return_type == "content_and_artifact" and isinstance(raw_result, tuple) and len(raw_result) == 2:
-                        content_value, artifact = raw_result
-                        self._tool_artifacts[tool_call_name] = artifact
-                    else:
-                        content_value = raw_result
-                        artifact = None
-                    
-                    content_for_llm = self._process_tool_call_result(content_value)
-                    
-                    tool_message = {
-                        "tool_call_id": tool_call_id,
-                        "role": "tool",
-                        "name": tool_call_name,
-                        "content": content_for_llm,
-                    }
-                    
-                    if self._should_include_artifacts_in_messages() and artifact is not None:
-                        tool_message["artifact"] = artifact
-                    
-                    return tool_message
-                    
-                except ToolExecutionError as e:
-                    logger.error(f"Tool execution error for {tool_call_name} (ID: {tool_call_id}): {e}")
-                    return {
-                        "tool_call_id": tool_call_id,
-                        "role": "tool",
-                        "name": tool_call_name,
-                        "content": json.dumps({
-                            "error": str(e),
-                            "message": "Tool execution failed",
-                        }),
-                    }
 
+        if tool_calls:
             if self.concurrent_tool_execution and len(tool_calls) > 1:
                 with ThreadPoolExecutor(max_workers=len(tool_calls)) as executor:
                     futures = {
-                        executor.submit(_process_individual_tool_call, tc): tc
+                        executor.submit(self._execute_single_tool_call, tc): tc
                         for tc in tool_calls
                     }
                     for future in as_completed(futures):
@@ -705,15 +695,15 @@ class Agent(Generic[_ExpectedContentType]):
                                 }),
                             })
             else:
-                for tc in tool_calls:
-                    tool_call_outputs.append(_process_individual_tool_call(tc))
-
+                tool_call_outputs.extend(
+                    self._execute_single_tool_call(tc) for tc in tool_calls
+                )
         try:
             msg_dict = {
                 "role": getattr(message, "role", "assistant"),
                 "content": getattr(message, "content", None),
             }
-            
+
             if tool_calls and isinstance(tool_calls, list):
                 msg_dict["tool_calls"] = self._serialize_tool_calls(tool_calls)
 
@@ -731,8 +721,14 @@ class Agent(Generic[_ExpectedContentType]):
         if not self.memory:
             return False
         
-        from thinagents.core.memory import InMemoryStore
+        from thinagents.memory import InMemoryStore
         return isinstance(self.memory, InMemoryStore) and self.memory.store_tool_artifacts
+
+    # Helper to prepare common streaming state
+    def _prepare_stream(self, input: str, conversation_id: Optional[str]) -> List[Dict[str, Any]]:
+        """Initialize artifacts and build messages for streaming runs."""
+        self._tool_artifacts = {}
+        return self._build_messages_with_memory(input, conversation_id)
 
     def _run_stream(
         self,
@@ -743,10 +739,8 @@ class Agent(Generic[_ExpectedContentType]):
         """
         Streamed version of run; yields ThinagentResponseStream chunks, including interleaved tool calls/results if requested.
         """
-        self._tool_artifacts = {}
+        messages = self._prepare_stream(input, conversation_id)
         logger.info(f"Agent '{self.name}' starting streaming execution")
-        
-        messages: List[Dict[str, Any]] = self._build_messages_with_memory(input, conversation_id)
         
         step_count = 0
         accumulated_content = ""
@@ -1063,14 +1057,10 @@ class Agent(Generic[_ExpectedContentType]):
     async def _execute_tool_async(self, tool_name: str, tool_args: Dict) -> Any:
         return await asyncio.to_thread(self._execute_tool, tool_name, tool_args)
 
-    async def _run_async(self, input: str, conversation_id: Optional[str] = None) -> ThinagentResponse[_ExpectedContentType]:
-        self._tool_artifacts = {}
+    async def _run_loop_async(self, messages: List[Dict[str, Any]], conversation_id: Optional[str] = None) -> ThinagentResponse[_ExpectedContentType]:
+        """Shared asynchronous step loop."""
         steps = 0
         json_correction_attempts = 0
-        
-        # Build messages with memory support
-        messages = self._build_messages_with_memory(input, conversation_id)
-
         while steps < self.max_steps:
             try:
                 response = await litellm.acompletion(
@@ -1097,7 +1087,6 @@ class Agent(Generic[_ExpectedContentType]):
                 if not hasattr(response, "choices") or not response.choices:  # type: ignore
                     logger.error("Async response has no choices")
                     raise AgentError("Invalid response structure: no choices")
-
                 finish_reason = response.choices[0].finish_reason  # type: ignore
                 message = response.choices[0].message  # type: ignore
                 tool_calls = getattr(message, "tool_calls", None) or []
@@ -1107,19 +1096,13 @@ class Agent(Generic[_ExpectedContentType]):
 
             if finish_reason == "stop" and not tool_calls:
                 return self._handle_completion(
-                    message,
-                    response_id,
-                    created_timestamp,
-                    model_used,
-                    finish_reason,
-                    metrics,
-                    system_fingerprint,
-                    messages,
-                    json_correction_attempts,
-                    conversation_id
+                    message, response_id, created_timestamp, model_used,
+                    finish_reason, metrics, system_fingerprint, messages,
+                    json_correction_attempts, conversation_id
                 )
 
             if finish_reason == "tool_calls" or tool_calls:
+                # reuse sync handler in thread to avoid blocking event loop
                 await asyncio.to_thread(self._handle_tool_calls, tool_calls, message, messages, conversation_id)
                 steps += 1
                 continue
@@ -1129,17 +1112,21 @@ class Agent(Generic[_ExpectedContentType]):
         logger.warning(f"Agent '{self.name}' reached max steps ({self.max_steps}) in async mode")
         raise MaxStepsExceededError(f"Max steps ({self.max_steps}) reached without final answer.")
 
+    async def _run_async(self, input: str, conversation_id: Optional[str] = None) -> ThinagentResponse[_ExpectedContentType]:
+        self._tool_artifacts = {}
+        messages = self._build_messages_with_memory(input, conversation_id)
+        return await self._run_loop_async(messages, conversation_id)
+
     async def _run_stream_async(
         self,
         input: str,
         stream_intermediate_steps: bool = False,
         conversation_id: Optional[str] = None,
     ) -> AsyncIterator[ThinagentResponseStream[Any]]:
-        self._tool_artifacts = {}
+        # artifacts initialized by helper
         logger.info(f"Agent '{self.name}' starting async streaming execution")
 
-        # Build messages with memory support
-        messages = self._build_messages_with_memory(input, conversation_id)
+        messages = self._prepare_stream(input, conversation_id)
         accumulated_content = ""  # Track accumulated content for memory
 
         step_count = 0
