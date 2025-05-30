@@ -3,7 +3,7 @@ from pathlib import Path
 
 setup(
     name="thinagents",
-    version="0.0.3",
+    version="0.0.4",
     author="Prabhu Kiran Konda",
     description="A lightweight AI Agent framework",
     long_description=Path("README.md").read_text(),

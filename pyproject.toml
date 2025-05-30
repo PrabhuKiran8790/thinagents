@@ -1,6 +1,6 @@
 [project]
 name = "thinagents"
-version = "0.0.3"
+version = "0.0.4"
 description = "A lightweight AI Agent framework"
 authors = [{ name = "Prabhu Kiran Konda" }]
 readme = "README.md"
