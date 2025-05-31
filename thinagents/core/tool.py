@@ -285,7 +285,7 @@ def tool(
     fn_for_tool: Optional[Callable[P, R]] = None,
     *,
     return_type: Literal["content", "content_and_artifact"] = "content",
-    pydantic_schema: Optional[Any] = None,  # Accepts a Pydantic BaseModel class
+    pydantic_schema: Optional[Any] = None,
     name: Optional[str] = None,
 ) -> ThinAgentsTool[P, R]:  # type: ignore
     """
@@ -304,7 +304,6 @@ def tool(
         A ThinAgentsTool object that can be used to execute the tool.
     """
     if fn_for_tool is None:
-        # return decorator when no function provided
         return lambda fn: tool(fn, return_type=return_type, pydantic_schema=pydantic_schema, name=name)  # type: ignore
     annotated_desc = ""
     actual_func = fn_for_tool
@@ -315,7 +314,6 @@ def tool(
 
     tool_name = name if name is not None else actual_func.__name__
 
-    # enforce return_type annotation compatibility at decoration time
     if return_type == "content_and_artifact":
         sig = inspect.signature(actual_func)
         ret_ann = sig.return_annotation
@@ -326,29 +324,25 @@ def tool(
             )
         origin = get_origin(ret_ann)
         args = get_args(ret_ann)
-        # annotation must be Tuple[...] of length 2
         if origin not in (tuple, Tuple) or len(args) != 2:
             raise ValueError(
                 f"Tool '{tool_name}' declared return_type='content_and_artifact' but return annotation is {ret_ann!r}, expected Tuple[content_type, artifact_type]"
             )
 
-    # If pydantic_schema is provided, validate it against the function signature
     schema_dict = None
     if pydantic_schema is not None:
         if not IS_PYDANTIC_AVAILABLE:
             raise ImportError("Pydantic is not available. Please install pydantic to use pydantic_schema.")
         if not (isinstance(pydantic_schema, type) and issubclass(pydantic_schema, _BaseModel)):
             raise ValueError("pydantic_schema must be a Pydantic BaseModel class")
-        # Use model_json_schema if available (Pydantic v2), else use schema (Pydantic v1)
         if hasattr(pydantic_schema, "model_json_schema"):
             schema_dict = pydantic_schema.model_json_schema()  # type: ignore
         elif hasattr(pydantic_schema, "schema"):
             schema_dict = pydantic_schema.schema()  # type: ignore
         else:
             raise ValueError("Provided pydantic_schema does not have a model_json_schema or schema method.")
-        # Remove the top-level 'title' key if present
         if "title" in schema_dict:
-            schema_dict = dict(schema_dict)  # Make a shallow copy
+            schema_dict = dict(schema_dict)
             schema_dict.pop("title")
         sig = inspect.signature(actual_func)
         func_param_names = list(sig.parameters.keys())
@@ -389,23 +383,21 @@ def tool(
         description = annotated_desc or func_doc or ""
         if schema_dict is not None:
             params_schema = schema_dict.copy()
-            # Remove 'description' from parameters and move to function-level if needed
             param_desc = params_schema.pop("description", None)
             if param_desc and not description:
                 description = param_desc
         else:
-            # generate original function schema
             type_hints = get_type_hints(actual_func, include_extras=True)
             generated_params_schema: Dict[str, Any] = {
                 "type": "object",
                 "properties": {},
                 "required": [],
-                "additionalProperties": False,  # Usually good for tools to be strict
+                "additionalProperties": False,
             }
             for name, param in sig.parameters.items():
                 annotation = type_hints.get(name, param.annotation)
                 if annotation is inspect.Parameter.empty:
-                    annotation = Any  # Default to Any if no type hint
+                    annotation = Any
                 param_def = _generate_param_schema(name, param, annotation)
                 generated_params_schema["properties"][name] = param_def  # type: ignore
                 if _is_required_parameter(param, annotation):
