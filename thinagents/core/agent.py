@@ -45,6 +45,11 @@ class MaxStepsExceededError(AgentError):
     pass
 
 
+class AsyncToolInSyncContextError(AgentError):
+    """Exception raised when an async tool is called in a synchronous agent run."""
+    pass
+
+
 def generate_tool_schemas(
     tools: Union[List[ThinAgentsTool], List[Callable]],
 ) -> Tuple[List[Dict], Dict[str, ThinAgentsTool]]:
@@ -116,6 +121,7 @@ class Agent(Generic[_ExpectedContentType]):
         sub_agents: Optional[List["Agent"]] = None,
         prompt: Optional[Union[str, PromptConfig]] = None,
         instructions: Optional[List[str]] = None,
+        propagate_subagent_instructions: bool = False,
         max_steps: int = DEFAULT_MAX_STEPS,
         concurrent_tool_execution: bool = True,
         response_format: Optional[Type[_ExpectedContentType]] = None,
@@ -144,6 +150,7 @@ class Agent(Generic[_ExpectedContentType]):
                 This can be a simple string or a `PromptConfig` object for more complex prompt engineering.
             instructions: A list of additional instruction strings to be appended to the system prompt.
                 Ignored when `prompt` is an instance of `PromptConfig`.
+            propagate_subagent_instructions: If True, any instructions given to sub-agents are automatically merged into this agent's own instructions.
             max_steps: The maximum number of conversational turns or tool execution
                 sequences the agent will perform before stopping. Defaults to 15.
             parallel_tool_calls: If True, allows the agent to request multiple tool calls
@@ -181,6 +188,8 @@ class Agent(Generic[_ExpectedContentType]):
         self.enable_schema_validation = enable_schema_validation
         if self.response_format_model_type:
             litellm.enable_json_schema_validation = self.enable_schema_validation
+
+        self.propagate_subagent_instructions = propagate_subagent_instructions
 
         self.concurrent_tool_execution = concurrent_tool_execution
         self.kwargs = kwargs
@@ -246,6 +255,12 @@ class Agent(Generic[_ExpectedContentType]):
         if tool is None:
             raise ToolExecutionError(f"Tool '{tool_name}' not found.")
 
+        if getattr(tool, "is_async_tool", False):
+            raise AsyncToolInSyncContextError(
+                f"Tool '{tool_name}' is asynchronous and cannot be called in a synchronous agent run. "
+                "Use `agent.arun()` or `agent.astream()` instead."
+            )
+
         try:
             logger.debug(f"Executing tool '{tool_name}' with args: {tool_args}")
 
@@ -271,16 +286,26 @@ class Agent(Generic[_ExpectedContentType]):
     def _build_system_prompt(self) -> str:
         """Build the system prompt for the agent."""
         if isinstance(self.prompt, PromptConfig):
-            return self.prompt.add_instruction(f"Your name is {self.name}").build()
-        base_prompt = (
-            f"You are a helpful assistant. Answer the user's question to the best of your ability. Your name is {self.name}."
-            if self.prompt is None
-            else self.prompt
-        )
-        if self.instructions:
-            base_prompt = f"{base_prompt}\n" + "\n".join(self.instructions)
+            prompt_config = self.prompt
+        else:
+            base_prompt = (
+                f"You are a helpful assistant. Your name is {self.name}. Answer the user's question to the best of your ability."
+                if self.prompt is None
+                else self.prompt
+            )
+            prompt_config = PromptConfig(base_prompt)
+            if self.instructions:
+                for instruction in self.instructions:
+                    prompt_config = prompt_config.add_instruction(instruction)
 
-        return base_prompt
+            # might remove this
+            for sa in self.sub_agents:
+                if sa.instructions:
+                    prompt_config = prompt_config.add_section(
+                        f"Instructions for sub-agent {sa.name}", sa.instructions
+                )
+        
+        return prompt_config.build()
 
     def _extract_usage_metrics(self, response: Any) -> Optional[UsageMetrics]:
         """Extract usage metrics from LLM response."""
@@ -1055,7 +1080,139 @@ class Agent(Generic[_ExpectedContentType]):
         return repr_str
 
     async def _execute_tool_async(self, tool_name: str, tool_args: Dict) -> Any:
-        return await asyncio.to_thread(self._execute_tool, tool_name, tool_args)
+        """
+        Executes a tool by name with the provided arguments, handling both sync and async tools.
+        """
+        tool = self.tool_maps.get(tool_name)
+        if tool is None:
+            raise ToolExecutionError(f"Tool '{tool_name}' not found.")
+
+        try:
+            logger.debug(f"Executing tool '{tool_name}' (async context) with args: {tool_args}")
+            if getattr(tool, "is_async_tool", False):
+                # Execute async tool directly, with timeout
+                try:
+                    result = await asyncio.wait_for(tool(**tool_args), timeout=self.tool_timeout)
+                    logger.debug(f"Async tool '{tool_name}' executed successfully")
+                    return result
+                except asyncio.TimeoutError as e:
+                    logger.error(f"Async tool '{tool_name}' execution timed out after {self.tool_timeout}s")
+                    raise ToolExecutionError(f"Async tool '{tool_name}' execution timed out") from e
+            else:
+                # Execute sync tool in a thread using asyncio.to_thread.
+                # Timeout is handled by asyncio.wait_for.
+                future = asyncio.to_thread(tool, **tool_args)
+                try:
+                    result = await asyncio.wait_for(future, timeout=self.tool_timeout)
+                    logger.debug(f"Sync tool '{tool_name}' executed successfully in thread")
+                    return result
+                except asyncio.TimeoutError as e:
+                    logger.error(f"Sync tool '{tool_name}' execution (in thread) timed out after {self.tool_timeout}s")
+                    raise ToolExecutionError(f"Sync tool '{tool_name}' (in thread) execution timed out") from e
+        except Exception as e:
+            logger.error(f"Tool '{tool_name}' execution failed in async context: {e}")
+            raise ToolExecutionError(f"Tool '{tool_name}' execution failed in async context: {e}") from e
+
+    async def _execute_single_tool_call_async(self, tc: Any) -> Dict[str, Any]:
+        """Parse, execute (async), and format a single tool call."""
+        tool_call_name = tc.function.name
+        tool_call_id = tc.id
+        tool = self.tool_maps.get(tool_call_name)
+        return_type = getattr(tool, "return_type", "content")
+        try:
+            tool_call_args = json.loads(tc.function.arguments)
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing tool arguments for {tool_call_name} (ID: {tool_call_id}): {e}")
+            return {
+                "tool_call_id": tool_call_id,
+                "role": "tool",
+                "name": tool_call_name,
+                "content": json.dumps({
+                    "error": str(e),
+                    "message": "Failed to parse arguments",
+                }),
+            }
+
+        try:
+            raw_result = await self._execute_tool_async(tool_call_name, tool_call_args)
+            if return_type == "content_and_artifact" and isinstance(raw_result, tuple) and len(raw_result) == 2:
+                content_value, artifact = raw_result
+                self._tool_artifacts[tool_call_name] = artifact
+            else:
+                content_value = raw_result
+                artifact = None
+
+            content_for_llm = self._process_tool_call_result(content_value)
+            tool_message = {
+                "tool_call_id": tool_call_id,
+                "role": "tool",
+                "name": tool_call_name,
+                "content": content_for_llm,
+            }
+            if self._should_include_artifacts_in_messages() and artifact is not None:
+                tool_message["artifact"] = artifact
+            return tool_message
+        except ToolExecutionError as e:
+            logger.error(f"Tool execution error for {tool_call_name} (ID: {tool_call_id}): {e}")
+            return {
+                "tool_call_id": tool_call_id,
+                "role": "tool",
+                "name": tool_call_name,
+                "content": json.dumps({
+                    "error": str(e),
+                    "message": "Tool execution failed",
+                }),
+            }
+
+    async def _handle_tool_calls_async(self, tool_calls: List[Any], message: Any, messages: List[Dict], conversation_id: Optional[str] = None) -> None:
+        """Handle tool calls execution asynchronously."""
+        tool_call_outputs = []
+
+        if tool_calls:
+            if self.concurrent_tool_execution and len(tool_calls) > 1:
+                # Use asyncio.gather for concurrent execution of async tool calls
+                results = await asyncio.gather(
+                    *(self._execute_single_tool_call_async(tc) for tc in tool_calls),
+                    return_exceptions=True  # Allow individual tasks to fail without stopping others
+                )
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        failed_tc = tool_calls[i]
+                        logger.error(f"Async tool call {failed_tc.function.name} (ID: {failed_tc.id}) failed: {result}")
+                        tool_call_outputs.append({
+                            "tool_call_id": failed_tc.id,
+                            "role": "tool",
+                            "name": failed_tc.function.name,
+                            "content": json.dumps({
+                                "error": str(result),
+                                "message": "Failed to retrieve tool result from concurrent async execution",
+                            }),
+                        })
+                    else:
+                        # Type checker knows result is Dict[str, Any] here due to the isinstance check
+                        tool_call_outputs.append(cast(Dict[str, Any], result))
+            else:
+                # Execute sequentially if concurrent_tool_execution is False or only one tool call
+                for tc in tool_calls:
+                    tool_call_outputs.append(await self._execute_single_tool_call_async(tc))
+        try:
+            msg_dict = {
+                "role": getattr(message, "role", "assistant"),
+                "content": getattr(message, "content", None),
+            }
+
+            if tool_calls and isinstance(tool_calls, list):
+                msg_dict["tool_calls"] = self._serialize_tool_calls(tool_calls)
+
+            messages.append(msg_dict)
+            messages.extend(tool_call_outputs)
+        except Exception as e:
+            logger.error(f"Failed to add messages to conversation in async handler: {e}")
+            raise AgentError(f"Failed to add messages to conversation in async handler: {e}") from e
+
+        if conversation_id and self.memory:
+            # Assuming _save_messages_to_memory is thread-safe or can be called from async context
+            self._save_messages_to_memory(messages, conversation_id)
 
     async def _run_loop_async(self, messages: List[Dict[str, Any]], conversation_id: Optional[str] = None) -> ThinagentResponse[_ExpectedContentType]:
         """Shared asynchronous step loop."""
@@ -1103,7 +1260,7 @@ class Agent(Generic[_ExpectedContentType]):
 
             if finish_reason == "tool_calls" or tool_calls:
                 # reuse sync handler in thread to avoid blocking event loop
-                await asyncio.to_thread(self._handle_tool_calls, tool_calls, message, messages, conversation_id)
+                await self._handle_tool_calls_async(tool_calls, message, messages, conversation_id)
                 steps += 1
                 continue
 

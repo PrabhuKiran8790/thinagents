@@ -313,6 +313,7 @@ def tool(
         annotated_desc = next((m for m in meta if isinstance(m, str)), "")
 
     tool_name = name if name is not None else actual_func.__name__
+    is_async_tool = inspect.iscoroutinefunction(actual_func)
 
     if return_type == "content_and_artifact":
         sig = inspect.signature(actual_func)
@@ -376,6 +377,7 @@ def tool(
 
     # store desired return_type on the wrapper
     wrapper.return_type = return_type  # type: ignore
+    wrapper.is_async_tool = is_async_tool # type: ignore
 
     def tool_schema() -> Dict[str, Any]:
         sig = inspect.signature(actual_func)
