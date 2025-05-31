@@ -281,9 +281,15 @@ def map_type_to_schema(py_type: Any) -> JSONSchemaType:
     return {"type": "object"}
 
 
-def tool(fn_for_tool: Optional[Callable[P, R]] = None, *, return_type: Literal["content", "content_and_artifact"] = "content") -> ThinAgentsTool[P, R]:  # type: ignore
+def tool(
+    fn_for_tool: Optional[Callable[P, R]] = None,
+    *,
+    return_type: Literal["content", "content_and_artifact"] = "content",
+    pydantic_schema: Optional[Any] = None,  # Accepts a Pydantic BaseModel class
+    name: Optional[str] = None,
+) -> ThinAgentsTool[P, R]:  # type: ignore
     """
-    Decorator to register a function as a ThinAgentsTool, optionally specifying the return type.
+    Decorator to register a function as a ThinAgentsTool, optionally specifying the return type and/or a pydantic schema.
     Enforces return type compatibility and attaches a tool_schema method for OpenAPI/JSON schema generation.
 
     Args:
@@ -291,19 +297,23 @@ def tool(fn_for_tool: Optional[Callable[P, R]] = None, *, return_type: Literal["
         return_type: The return type of the tool.
             - "content": The tool returns only content. This is the default.  
             - "content_and_artifact": The tool returns both content and an artifact, where the artifact is something that can be sent downstream.
+        pydantic_schema: If provided, should be a Pydantic BaseModel class. The schema will be extracted internally and validated against the function signature.
+        name: If provided, use this as the tool's name in the schema and for the wrapper. Otherwise, use the function's name.
 
     Returns:
         A ThinAgentsTool object that can be used to execute the tool.
     """
     if fn_for_tool is None:
         # return decorator when no function provided
-        return lambda fn: tool(fn, return_type=return_type)  # type: ignore
+        return lambda fn: tool(fn, return_type=return_type, pydantic_schema=pydantic_schema, name=name)  # type: ignore
     annotated_desc = ""
     actual_func = fn_for_tool
     if get_origin(fn_for_tool) is Annotated:
         unwrapped_func, *meta = get_args(fn_for_tool)
         actual_func = unwrapped_func
         annotated_desc = next((m for m in meta if isinstance(m, str)), "")
+
+    tool_name = name if name is not None else actual_func.__name__
 
     # enforce return_type annotation compatibility at decoration time
     if return_type == "content_and_artifact":
@@ -312,14 +322,51 @@ def tool(fn_for_tool: Optional[Callable[P, R]] = None, *, return_type: Literal["
         # no annotation provided
         if ret_ann is inspect.Signature.empty:
             raise ValueError(
-                f"Tool '{actual_func.__name__}' declared return_type='content_and_artifact' but no return annotation found"
+                f"Tool '{tool_name}' declared return_type='content_and_artifact' but no return annotation found"
             )
         origin = get_origin(ret_ann)
         args = get_args(ret_ann)
         # annotation must be Tuple[...] of length 2
         if origin not in (tuple, Tuple) or len(args) != 2:
             raise ValueError(
-                f"Tool '{actual_func.__name__}' declared return_type='content_and_artifact' but return annotation is {ret_ann!r}, expected Tuple[content_type, artifact_type]"
+                f"Tool '{tool_name}' declared return_type='content_and_artifact' but return annotation is {ret_ann!r}, expected Tuple[content_type, artifact_type]"
+            )
+
+    # If pydantic_schema is provided, validate it against the function signature
+    schema_dict = None
+    if pydantic_schema is not None:
+        if not IS_PYDANTIC_AVAILABLE:
+            raise ImportError("Pydantic is not available. Please install pydantic to use pydantic_schema.")
+        if not (isinstance(pydantic_schema, type) and issubclass(pydantic_schema, _BaseModel)):
+            raise ValueError("pydantic_schema must be a Pydantic BaseModel class")
+        # Use model_json_schema if available (Pydantic v2), else use schema (Pydantic v1)
+        if hasattr(pydantic_schema, "model_json_schema"):
+            schema_dict = pydantic_schema.model_json_schema()  # type: ignore
+        elif hasattr(pydantic_schema, "schema"):
+            schema_dict = pydantic_schema.schema()  # type: ignore
+        else:
+            raise ValueError("Provided pydantic_schema does not have a model_json_schema or schema method.")
+        # Remove the top-level 'title' key if present
+        if "title" in schema_dict:
+            schema_dict = dict(schema_dict)  # Make a shallow copy
+            schema_dict.pop("title")
+        sig = inspect.signature(actual_func)
+        func_param_names = list(sig.parameters.keys())
+        func_required = [
+            name for name, param in sig.parameters.items()
+            if _is_required_parameter(param, param.annotation if param.annotation is not inspect.Parameter.empty else Any)
+        ]
+        schema_properties = list(schema_dict.get("properties", {}).keys())
+        schema_required = list(schema_dict.get("required", []))
+        # Check that all function parameters are in schema properties and vice versa
+        if set(func_param_names) != set(schema_properties):
+            raise ValueError(
+                f"pydantic_schema properties {schema_properties} do not match function parameters {func_param_names} for tool '{tool_name}'"
+            )
+        # Check that required match
+        if set(func_required) != set(schema_required):
+            raise ValueError(
+                f"pydantic_schema required {schema_required} do not match function required parameters {func_required} for tool '{tool_name}'"
             )
 
     @functools.wraps(actual_func)
@@ -329,7 +376,7 @@ def tool(fn_for_tool: Optional[Callable[P, R]] = None, *, return_type: Literal["
         # if the tool declares content_and_artifact, enforce a 2-tuple return
         if return_type == "content_and_artifact" and not (isinstance(result, tuple) and len(result) == 2):
             raise ValueError(
-                f"Tool '{actual_func.__name__}' declared return_type='content_and_artifact' but returned {result!r}"
+                f"Tool '{tool_name}' declared return_type='content_and_artifact' but returned {result!r}"
             )
         return result
 
@@ -337,38 +384,39 @@ def tool(fn_for_tool: Optional[Callable[P, R]] = None, *, return_type: Literal["
     wrapper.return_type = return_type  # type: ignore
 
     def tool_schema() -> Dict[str, Any]:
-        # generate original function schema
         sig = inspect.signature(actual_func)
-        # include_extras=True is important for Annotated
-        type_hints = get_type_hints(actual_func, include_extras=True)
-
-        params_schema: Dict[str, Any] = {
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": False,  # Usually good for tools to be strict
-        }
-
-        for name, param in sig.parameters.items():
-            annotation = type_hints.get(name, param.annotation)
-            if annotation is inspect.Parameter.empty:
-                annotation = Any  # Default to Any if no type hint
-
-            param_def = _generate_param_schema(name, param, annotation)
-            params_schema["properties"][name] = param_def  # type: ignore
-            if _is_required_parameter(param, annotation):
-                params_schema["required"].append(name)
-
-        params_schema["required"] = sorted(list(set(params_schema["required"])))
-
         func_doc = inspect.getdoc(actual_func)
         description = annotated_desc or func_doc or ""
-
+        if schema_dict is not None:
+            params_schema = schema_dict.copy()
+            # Remove 'description' from parameters and move to function-level if needed
+            param_desc = params_schema.pop("description", None)
+            if param_desc and not description:
+                description = param_desc
+        else:
+            # generate original function schema
+            type_hints = get_type_hints(actual_func, include_extras=True)
+            generated_params_schema: Dict[str, Any] = {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,  # Usually good for tools to be strict
+            }
+            for name, param in sig.parameters.items():
+                annotation = type_hints.get(name, param.annotation)
+                if annotation is inspect.Parameter.empty:
+                    annotation = Any  # Default to Any if no type hint
+                param_def = _generate_param_schema(name, param, annotation)
+                generated_params_schema["properties"][name] = param_def  # type: ignore
+                if _is_required_parameter(param, annotation):
+                    generated_params_schema["required"].append(name)
+            generated_params_schema["required"] = sorted(list(set(generated_params_schema["required"])))
+            params_schema = generated_params_schema
         # wrap schema with return_type metadata
         original_schema = {
             "type": "function",
             "function": {
-                "name": actual_func.__name__,
+                "name": tool_name,
                 "description": description,
                 "parameters": params_schema,
             },
@@ -376,13 +424,8 @@ def tool(fn_for_tool: Optional[Callable[P, R]] = None, *, return_type: Literal["
         return {"tool_schema": original_schema, "return_type": return_type}
 
     setattr(wrapper, "tool_schema", tool_schema)
-    wrapper.__name__ = actual_func.__name__
+    wrapper.__name__ = tool_name
 
-    # The type: ignore below is because `wrapper` (a function) doesn't statically
-    # appear as a ThinAgentsTool to the type checker just by setting an attribute.
-    # Using `cast` can make this more explicit if preferred.
-    # from typing import cast
-    # return cast(ThinAgentsTool[P, R], wrapper)
     return wrapper  # type: ignore
 
 
