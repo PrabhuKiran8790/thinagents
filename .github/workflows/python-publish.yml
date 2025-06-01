@@ -1,17 +1,16 @@
-# This workflow will upload a Python Package to PyPI when a release is created
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python#publishing-to-package-registries
-
 name: Upload Python Package
 
 on:
-  release:
-    types: [published]
+  push:
+    branches:
+      - main
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
-  release-build:
+  build-publish:
     runs-on: ubuntu-latest
 
     steps:
@@ -21,38 +20,31 @@ jobs:
         with:
           python-version: ">=3.11"
 
-      - name: Clean old build artifacts
-        run: rm -rf dist/*
+      - name: Install tools
+        run: python -m pip install build toml requests
 
-      - name: Build release distributions
+      - name: Read version from pyproject.toml
+        id: get_version
         run: |
-          python -m pip install build
-          python -m build
+          VERSION=$(python -c "import toml; print(toml.load('pyproject.toml')['project']['version'])")
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Version: $VERSION"
 
-      - name: Upload distributions
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-dists
-          path: dist/
+      - name: Check if version exists on PyPI
+        run: |
+          EXISTS=$(curl -s https://pypi.org/pypi/thinagents/json | jq -r ".releases | has(\"$VERSION\")")
+          if [ "$EXISTS" == "true" ]; then
+            echo "Version $VERSION already exists on PyPI. Skipping publish."
+            exit 1
+          fi
 
-  pypi-publish:
-    runs-on: ubuntu-latest
-    needs:
-      - release-build
-    permissions:
-      id-token: write
+      - name: Clean old builds
+        run: rm -rf dist/ build/ *.egg-info
 
-    environment:
-      name: pypi
+      - name: Build
+        run: python -m build
 
-    steps:
-      - name: Retrieve release distributions
-        uses: actions/download-artifact@v4
-        with:
-          name: release-dists
-          path: dist/
-
-      - name: Publish release distributions to PyPI
+      - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
