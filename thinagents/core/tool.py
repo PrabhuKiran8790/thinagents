@@ -20,6 +20,7 @@ from typing import (
     ParamSpec,
     runtime_checkable,
 )
+import logging
 
 try:
     from typing import get_type_hints
@@ -31,6 +32,8 @@ from collections.abc import Sequence, Mapping
 import enum
 from dataclasses import is_dataclass, fields
 import functools
+
+logger = logging.getLogger(__name__)
 
 P = ParamSpec("P")
 R = TypeVar("R", covariant=True)
@@ -201,10 +204,14 @@ class PydanticHandler(BaseTypeHandler):
 
     def handle(self, py_type: Any, _: Callable[[Any], JSONSchemaType]) -> JSONSchemaType:
         schema: Optional[JSONSchemaType] = None
-        if _PYDANTIC_V2 and hasattr(py_type, "model_json_schema"):
-            schema = py_type.model_json_schema()  # type: ignore
-        elif _PYDANTIC_V1 and hasattr(py_type, "schema"):
-            schema = py_type.schema()  # type: ignore
+        try:
+            if _PYDANTIC_V2 and hasattr(py_type, "model_json_schema"):
+                schema = py_type.model_json_schema()  # type: ignore
+            elif _PYDANTIC_V1 and hasattr(py_type, "schema"):
+                schema = py_type.schema()  # type: ignore
+        except Exception as e:
+            logger.error(f"Error generating Pydantic schema for {py_type}: {e}", exc_info=True)
+            return {"type": "object", "description": f"Error generating Pydantic schema: {e}"}
         return schema if schema is not None else {"type": "object"}
 
 class SequenceHandler(BaseTypeHandler):
@@ -270,14 +277,21 @@ def map_type_to_schema(py_type: Any) -> JSONSchemaType:
         return map_type_to_schema(args[0]) if args else {}
 
     if py_type is Any:
+        logger.debug(f"Mapping 'Any' type to empty schema.")
         return {}
 
     if isinstance(py_type, TypeVar):
         if constraints := getattr(py_type, "__constraints__", None):
+            logger.debug(f"Mapping TypeVar {py_type} with constraints {constraints} to anyOf schema.")
             return {"anyOf": [map_type_to_schema(c) for c in constraints]}
         bound = getattr(py_type, "__bound__", None)
-        return map_type_to_schema(bound) if bound and bound is not object else {}
+        if bound and bound is not object and bound is not py_type:
+            logger.debug(f"Mapping TypeVar {py_type} with bound {bound} to schema of bound type.")
+            return map_type_to_schema(bound)
+        logger.debug(f"Mapping TypeVar {py_type} (unconstrained or self-bound) to empty schema.")
+        return {}
 
+    logger.warning(f"No specific schema handler for type {py_type}. Defaulting to 'object'.")
     return {"type": "object"}
 
 

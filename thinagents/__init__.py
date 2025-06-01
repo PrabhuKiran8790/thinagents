@@ -16,6 +16,7 @@ from thinagents.core.agent import Agent
 from thinagents.utils.prompts import PromptConfig
 from thinagents.core.tool import tool
 from thinagents.core.response_models import ThinagentResponse
+from thinagents.core.mcp import MCPServerConfig
 
 
-__all__ = ["Agent", "PromptConfig", "tool", "ThinagentResponse"]
+__all__ = ["Agent", "PromptConfig", "tool", "ThinagentResponse", "MCPServerConfig"]

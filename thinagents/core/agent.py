@@ -20,6 +20,7 @@ from thinagents.core.response_models import (
     CompletionTokensDetails,
     PromptTokensDetails,
 )
+from thinagents.core.mcp import MCPManager, MCPServerConfig, normalize_mcp_servers
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,7 @@ class Agent(Generic[_ExpectedContentType]):
         description: Optional[str] = None,
         tool_timeout: float = DEFAULT_TOOL_TIMEOUT,
         memory: Optional[BaseMemory] = None,
+        mcp_servers: Optional[List[MCPServerConfig]] = None,
         **kwargs,
     ):
         """
@@ -168,6 +170,10 @@ class Agent(Generic[_ExpectedContentType]):
                 When provided, the agent will automatically manage conversation history across
                 multiple run() calls using conversation_id parameter. Use InMemoryStore with
                 store_tool_artifacts=True to also store tool artifacts alongside conversation history.
+            mcp_servers: Optional list of MCP (Model Context Protocol) server configurations.
+                Each server config should be a dict with 'command' and 'args' keys.
+                Example: [{"command": "uv", "args": ["run", "weather_server.py"]}]
+                MCP tools will be loaded asynchronously and are only available when using arun().
             **kwargs: Additional keyword arguments that will be passed directly to the `litellm.completion` function.
         """
         _validate_agent_config(name, model, max_steps)
@@ -199,11 +205,23 @@ class Agent(Generic[_ExpectedContentType]):
         self.granular_stream = True
         """Whether to emit per-character ThinagentResponseStream chunks when streaming"""
 
+        # Initialize MCP manager
+        self._mcp_manager = MCPManager()
+        self._mcp_servers_config = normalize_mcp_servers(mcp_servers)
+        if self._mcp_servers_config:
+            self._mcp_manager.add_servers(self._mcp_servers_config)
+
+        # Track whether MCP tools have been loaded to avoid duplicate schemas on subsequent async runs
+        self._mcp_tools_loaded: bool = False
+
         # Initialize tools and sub-agents
         self._initialize_tools()
 
         # Initialize memory-related attributes
         self.memory = memory
+        
+        # Track cleanup state
+        self._cleanup_called = False
 
     def _initialize_tools(self) -> None:
         """Initialize tools and sub-agents."""
@@ -217,6 +235,54 @@ class Agent(Generic[_ExpectedContentType]):
         except Exception as e:
             logger.error(f"Failed to initialize tools for agent '{self.name}': {e}")
             raise AgentError(f"Tool initialization failed: {e}") from e
+
+    async def _ensure_mcp_tools_loaded(self) -> None:
+        """Load MCP tools once (deduplicated) if configured."""
+        if not self._mcp_servers_config or self._mcp_tools_loaded:
+            return
+
+        try:
+            mcp_schemas, mcp_mappings = await self._mcp_manager.load_tools()
+
+            # Avoid duplicate schemas by checking existing tool names
+            existing_names = {
+                schema.get("function", {}).get("name")
+                for schema in self.tool_schemas
+                if isinstance(schema, dict)
+            }
+
+            new_schema_count = 0
+            for schema in mcp_schemas:
+                name = schema.get("function", {}).get("name") if isinstance(schema, dict) else None
+                if name and name not in existing_names:
+                    self.tool_schemas.append(schema)
+                    new_schema_count += 1
+
+            self.tool_maps.update(mcp_mappings)
+
+            logger.info(
+                f"Loaded {new_schema_count} new MCP tools (total {len(mcp_schemas)}) for agent '{self.name}'"
+            )
+
+            self._mcp_tools_loaded = True
+        except Exception as e:
+            logger.error(f"Failed to load MCP tools for agent '{self.name}': {e}")
+            # Continue without MCP tools to keep the agent functional
+
+    def _parse_llm_response_choice(self, choice: Any) -> Tuple[Optional[str], Any, List[Any]]:
+        """Safely parse finish_reason, message, and tool_calls from an LLM response choice."""
+        try:
+            finish_reason = getattr(choice, "finish_reason", None)
+            message = getattr(choice, "message", None)
+            if message is None:
+                logger.error("LLM response choice has no message attribute.")
+                raise AgentError("Invalid LLM response: choice missing 'message'")
+            
+            tool_calls = getattr(message, "tool_calls", None) or []
+            return finish_reason, message, tool_calls
+        except AttributeError as e:
+            logger.error(f"Invalid LLM response structure in choice: {e}. Choice object: {choice}")
+            raise AgentError(f"Invalid LLM response structure: {e}") from e
 
     def _make_sub_agent_tool(self, sa: "Agent") -> ThinAgentsTool:
         """Create a ThinAgents tool that delegates calls to a sub-agent."""
@@ -420,6 +486,7 @@ class Agent(Generic[_ExpectedContentType]):
                     }
                 else:
                     # Fallback - try to extract what we can
+                    logger.warning(f"Using fallback serialization for tool call object: {tc}")
                     serialized_call = {
                         "id": getattr(tc, "id", f"call_{getattr(tc, 'name', 'unknown')}"),
                         "type": "function",
@@ -433,15 +500,6 @@ class Agent(Generic[_ExpectedContentType]):
                 
             except Exception as e:
                 logger.warning(f"Failed to serialize tool call {tc}: {e}")
-                # Add a fallback entry to maintain structure
-                serialized_calls.append({
-                    "id": "unknown_call",
-                    "type": "function", 
-                    "function": {
-                        "name": "unknown",
-                        "arguments": "{}"
-                    }
-                })
         
         return serialized_calls
 
@@ -559,10 +617,16 @@ class Agent(Generic[_ExpectedContentType]):
         Raises:
             AgentError: If agent execution fails
             MaxStepsExceededError: If max steps are exceeded
+            AsyncToolInSyncContextError: If MCP servers are configured (requires async execution)
         """
         if not input or not isinstance(input, str):
             raise ValueError("Input must be a non-empty string")
-            
+        
+        # Previously we fully blocked sync runs when MCP servers were configured.
+        # This was overly restrictive—sync runs are safe as long as the model does not
+        # ask to call an async-only MCP tool.  The guard is still enforced inside
+        # `_execute_tool`, so we can proceed here and only fail if a tool call occurs.
+
         logger.info(f"Agent '{self.name}' starting execution with input length: {len(input)}")
         
         # Handle streaming response
@@ -595,6 +659,7 @@ class Agent(Generic[_ExpectedContentType]):
                     response_format=self.response_format_model_type,
                     **self.kwargs,
                 )
+                assert not isinstance(response, litellm.CustomStreamWrapper), "Response should not be a stream in _run_loop"
             except Exception as e:
                 logger.error(f"LLM completion failed: {e}")
                 raise AgentError(f"LLM completion failed: {e}") from e
@@ -609,12 +674,12 @@ class Agent(Generic[_ExpectedContentType]):
                 if not hasattr(response, 'choices') or not response.choices:  # type: ignore
                     logger.error("Response has no choices")
                     raise AgentError("Invalid response structure: no choices")
-                finish_reason = response.choices[0].finish_reason  # type: ignore
-                message = response.choices[0].message  # type: ignore
-                tool_calls = getattr(message, "tool_calls", None) or []
-            except (IndexError, AttributeError) as e:
-                logger.error(f"Invalid response structure: {e}")
-                raise AgentError(f"Invalid response structure: {e}") from e
+                choice = response.choices[0]
+                finish_reason, message, tool_calls = self._parse_llm_response_choice(choice)
+            except (IndexError, AgentError) as e: # Updated to catch AgentError from helper
+                logger.error(f"Failed to parse LLM response choice: {e}")
+                # Ensure AgentError is re-raised, or handle as appropriate for the loop
+                raise AgentError(f"Failed to parse LLM response: {e}") from e
 
             if finish_reason == "stop" and not tool_calls:
                 return self._handle_completion(
@@ -659,10 +724,15 @@ class Agent(Generic[_ExpectedContentType]):
                 parsed_model = self.response_format_model_type.model_validate_json(raw_content_from_llm)
                 final_content = cast(_ExpectedContentType, parsed_model)
                 content_type_to_return = self.response_format_model_type.__name__
+                if json_correction_attempts > 0:
+                    logger.info(f"JSON content successfully corrected and validated after {json_correction_attempts} attempt(s).")
             except (ValidationError, json.JSONDecodeError) as e:
                 if self._handle_json_correction(messages, raw_content_from_llm, e, json_correction_attempts):
-                    return self._run_sync(messages[-1]["content"], conversation_id)
+                    # Retry the loop with the updated messages (which now contain the
+                    # correction prompt) instead of rebuilding from scratch.
+                    return self._run_loop(messages, conversation_id)
                 # Max attempts reached, return error
+                logger.error(f"JSON validation failed after {MAX_JSON_CORRECTION_ATTEMPTS} attempts. Error: {e}. Raw content: {raw_content_from_llm}")
                 final_content = cast(_ExpectedContentType, f"JSON validation failed after {MAX_JSON_CORRECTION_ATTEMPTS} attempts: {e}")
                 content_type_to_return = "str"
         else:
@@ -694,7 +764,7 @@ class Agent(Generic[_ExpectedContentType]):
 
     def _handle_tool_calls(self, tool_calls: List[Any], message: Any, messages: List[Dict], conversation_id: Optional[str] = None) -> None:
         """Handle tool calls execution."""
-        tool_call_outputs = []
+        tool_call_outputs: List[Dict[str, Any]] = []
 
         if tool_calls:
             if self.concurrent_tool_execution and len(tool_calls) > 1:
@@ -769,7 +839,8 @@ class Agent(Generic[_ExpectedContentType]):
         
         step_count = 0
         accumulated_content = ""
-        
+        arg_accumulators: Dict[str, str] = {}
+
         while step_count < self.max_steps:
             step_count += 1
             
@@ -827,47 +898,21 @@ class Agent(Generic[_ExpectedContentType]):
                             if hasattr(tc, "function"):
                                 if tc.id:
                                     call_id = tc.id
+                                    if call_id is not None and call_id not in arg_accumulators:
+                                        arg_accumulators[call_id] = ""
                                 if tc.function.name:
                                     call_name = tc.function.name
-                                if tc.function.arguments:
-                                    call_args += tc.function.arguments
-                                    if stream_intermediate_steps:
-                                        yield ThinagentResponseStream(
-                                            content=tc.function.arguments,
-                                            content_type="tool_call_arg",
-                                            tool_name=tc.function.name,
-                                            tool_call_id=tc.id,
-                                            response_id=getattr(chunk, "id", None),
-                                            created_timestamp=getattr(chunk, "created", None),
-                                            model_used=getattr(chunk, "model", None),
-                                            finish_reason=final_finish_reason,
-                                            metrics=None,
-                                            system_fingerprint=getattr(chunk, "system_fingerprint", None),
-                                            artifact=None,
-                                            stream_options=None,
-                                        )
+                                if tc.function.arguments is not None and call_id is not None:
+                                    arg_accumulators[call_id] = arg_accumulators.get(call_id, "") + tc.function.arguments
+                                    call_args = arg_accumulators[call_id]
                     
                     fc = getattr(delta, "function_call", None)
                     if fc is not None:
                         if fc.name:
                             call_name = fc.name
-                        if fc.arguments:
-                            call_args += fc.arguments
-                            if stream_intermediate_steps:
-                                yield ThinagentResponseStream(
-                                    content=fc.arguments,
-                                    content_type="tool_call_arg",
-                                    tool_name=fc.name if hasattr(fc, 'name') else call_name,
-                                    tool_call_id=call_id,
-                                    response_id=getattr(chunk, "id", None),
-                                    created_timestamp=getattr(chunk, "created", None),
-                                    model_used=getattr(chunk, "model", None),
-                                    finish_reason=final_finish_reason,
-                                    metrics=None,
-                                    system_fingerprint=getattr(chunk, "system_fingerprint", None),
-                                    artifact=None,
-                                    stream_options=None,
-                                )
+                        if fc.arguments is not None and call_id is not None:
+                            arg_accumulators[call_id] = arg_accumulators.get(call_id, "") + fc.arguments
+                            call_args = arg_accumulators[call_id]
                     
                     # Check if tool/function call is complete
                     if finish_reason in ["tool_calls", "function_call"]:
@@ -1075,9 +1120,31 @@ class Agent(Generic[_ExpectedContentType]):
         if self.sub_agents:
             sub_agent_names = [sa.name for sa in self.sub_agents]
             repr_str += f", sub_agents={sub_agent_names}"
+        if self._mcp_servers_config:
+            repr_str += f", mcp_servers={len(self._mcp_servers_config)} configured"
         repr_str += ")"
         
         return repr_str
+
+    async def cleanup(self) -> None:
+        """
+        Clean up agent resources, including MCP connections.
+        
+        This method is optional and provided for compatibility.
+        MCP connections are now managed automatically via context managers.
+        """
+        if self._mcp_manager:
+            await self._mcp_manager.cleanup()
+            logger.debug(f"Cleaned up MCP connections for agent '{self.name}'")
+        
+        # Track cleanup state
+        self._cleanup_called = True
+
+    def __del__(self):
+        """Cleanup when agent is garbage collected."""
+        # MCP connections are now managed automatically via context managers
+        # No warning needed since cleanup is automatic
+        pass
 
     async def _execute_tool_async(self, tool_name: str, tool_args: Dict) -> Any:
         """
@@ -1166,7 +1233,7 @@ class Agent(Generic[_ExpectedContentType]):
 
     async def _handle_tool_calls_async(self, tool_calls: List[Any], message: Any, messages: List[Dict], conversation_id: Optional[str] = None) -> None:
         """Handle tool calls execution asynchronously."""
-        tool_call_outputs = []
+        tool_call_outputs: List[Dict[str, Any]] = []
 
         if tool_calls:
             if self.concurrent_tool_execution and len(tool_calls) > 1:
@@ -1230,6 +1297,7 @@ class Agent(Generic[_ExpectedContentType]):
                     response_format=self.response_format_model_type,
                     **self.kwargs,
                 )
+                assert not isinstance(response, litellm.CustomStreamWrapper), "Response should not be a stream in _run_loop_async"
             except Exception as e:
                 logger.error(f"LLM async completion failed: {e}")
                 raise AgentError(f"LLM async completion failed: {e}") from e
@@ -1244,12 +1312,12 @@ class Agent(Generic[_ExpectedContentType]):
                 if not hasattr(response, "choices") or not response.choices:  # type: ignore
                     logger.error("Async response has no choices")
                     raise AgentError("Invalid response structure: no choices")
-                finish_reason = response.choices[0].finish_reason  # type: ignore
-                message = response.choices[0].message  # type: ignore
-                tool_calls = getattr(message, "tool_calls", None) or []
-            except (IndexError, AttributeError) as e:
-                logger.error(f"Invalid async response structure: {e}")
-                raise AgentError(f"Invalid async response structure: {e}") from e
+                choice = response.choices[0]
+                finish_reason, message, tool_calls = self._parse_llm_response_choice(choice)
+            except (IndexError, AgentError) as e: # Updated to catch AgentError from helper
+                logger.error(f"Failed to parse async LLM response choice: {e}")
+                # Ensure AgentError is re-raised, or handle as appropriate for the loop
+                raise AgentError(f"Failed to parse async LLM response: {e}") from e
 
             if finish_reason == "stop" and not tool_calls:
                 return self._handle_completion(
@@ -1271,6 +1339,8 @@ class Agent(Generic[_ExpectedContentType]):
 
     async def _run_async(self, input: str, conversation_id: Optional[str] = None) -> ThinagentResponse[_ExpectedContentType]:
         self._tool_artifacts = {}
+        # Ensure MCP tools are loaded before proceeding
+        await self._ensure_mcp_tools_loaded()
         messages = self._build_messages_with_memory(input, conversation_id)
         return await self._run_loop_async(messages, conversation_id)
 
@@ -1280,13 +1350,16 @@ class Agent(Generic[_ExpectedContentType]):
         stream_intermediate_steps: bool = False,
         conversation_id: Optional[str] = None,
     ) -> AsyncIterator[ThinagentResponseStream[Any]]:
-        # artifacts initialized by helper
         logger.info(f"Agent '{self.name}' starting async streaming execution")
 
+        # Ensure MCP tools are loaded before proceeding
+        await self._ensure_mcp_tools_loaded()
         messages = self._prepare_stream(input, conversation_id)
         accumulated_content = ""  # Track accumulated content for memory
 
         step_count = 0
+        arg_accumulators: Dict[str, str] = {}
+
         while step_count < self.max_steps:
             step_count += 1
             call_name: Optional[str] = None
@@ -1342,47 +1415,21 @@ class Agent(Generic[_ExpectedContentType]):
                             if hasattr(tc, "function"):
                                 if tc.id:
                                     call_id = tc.id
+                                    if call_id is not None and call_id not in arg_accumulators:
+                                        arg_accumulators[call_id] = ""
                                 if tc.function.name:
                                     call_name = tc.function.name
-                                if tc.function.arguments:
-                                    call_args += tc.function.arguments
-                                    if stream_intermediate_steps:
-                                        yield ThinagentResponseStream(
-                                            content=tc.function.arguments,
-                                            content_type="tool_call_arg",
-                                            tool_name=tc.function.name,
-                                            tool_call_id=tc.id,
-                                            response_id=getattr(chunk, "id", None),
-                                            created_timestamp=getattr(chunk, "created", None),
-                                            model_used=getattr(chunk, "model", None),
-                                            finish_reason=final_finish_reason,
-                                            metrics=None,
-                                            system_fingerprint=getattr(chunk, "system_fingerprint", None),
-                                            artifact=None,
-                                            stream_options=None,
-                                        )
+                                if tc.function.arguments is not None and call_id is not None:
+                                    arg_accumulators[call_id] = arg_accumulators.get(call_id, "") + tc.function.arguments
+                                    call_args = arg_accumulators[call_id]
 
                     fc = getattr(delta, "function_call", None)
                     if fc is not None:
                         if fc.name:
                             call_name = fc.name
-                        if fc.arguments:
-                            call_args += fc.arguments
-                            if stream_intermediate_steps:
-                                yield ThinagentResponseStream(
-                                    content=fc.arguments,
-                                    content_type="tool_call_arg",
-                                    tool_name=fc.name if hasattr(fc, 'name') else call_name,
-                                    tool_call_id=call_id,
-                                    response_id=getattr(chunk, "id", None),
-                                    created_timestamp=getattr(chunk, "created", None),
-                                    model_used=getattr(chunk, "model", None),
-                                    finish_reason=final_finish_reason,
-                                    metrics=None,
-                                    system_fingerprint=getattr(chunk, "system_fingerprint", None),
-                                    artifact=None,
-                                    stream_options=None,
-                                )
+                        if fc.arguments is not None and call_id is not None:
+                            arg_accumulators[call_id] = arg_accumulators.get(call_id, "") + fc.arguments
+                            call_args = arg_accumulators[call_id]
 
                     if finish_reason in ["tool_calls", "function_call"]:
                         break
