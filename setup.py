@@ -3,7 +3,6 @@ from pathlib import Path
 
 setup(
     name="thinagents",
-    version="0.0.5",
     author="Prabhu Kiran Konda",
     description="A lightweight AI Agent framework",
     long_description=Path("README.md").read_text(),
@@ -22,4 +21,6 @@ setup(
         "Operating System :: OS Independent",
     ],
     keywords="AI LLM Agentic AI AI Agents",
+    use_scm_version=True,
+    setup_requires=["setuptools-scm"],
 )

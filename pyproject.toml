@@ -1,6 +1,5 @@
 [project]
 name = "thinagents"
-version = "0.0.5"
 description = "A lightweight AI Agent framework"
 authors = [{ name = "Prabhu Kiran Konda" }]
 readme = "README.md"
@@ -13,10 +12,15 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = ["litellm>=1.70.0", "graphviz>=0.20.0"]
+dynamic = ["version"]
 
 [project.urls]
 Homepage = "https://github.com/PrabhuKiran8790/thinagents"
 
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+version_scheme = "post-release"
+local_scheme = "no-local-version"
