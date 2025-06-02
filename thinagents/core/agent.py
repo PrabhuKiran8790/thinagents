@@ -205,23 +205,16 @@ class Agent(Generic[_ExpectedContentType]):
         self.granular_stream = True
         """Whether to emit per-character ThinagentResponseStream chunks when streaming"""
 
-        # Initialize MCP manager
         self._mcp_manager = MCPManager()
         self._mcp_servers_config = normalize_mcp_servers(mcp_servers)
         if self._mcp_servers_config:
             self._mcp_manager.add_servers(self._mcp_servers_config)
 
-        # Track whether MCP tools have been loaded to avoid duplicate schemas on subsequent async runs
         self._mcp_tools_loaded: bool = False
 
-        # Initialize tools and sub-agents
         self._initialize_tools()
 
-        # Initialize memory-related attributes
         self.memory = memory
-        
-        # Track cleanup state
-        self._cleanup_called = False
 
     def _initialize_tools(self) -> None:
         """Initialize tools and sub-agents."""
@@ -265,9 +258,27 @@ class Agent(Generic[_ExpectedContentType]):
             )
 
             self._mcp_tools_loaded = True
-        except Exception as e:
-            logger.error(f"Failed to load MCP tools for agent '{self.name}': {e}")
-            # Continue without MCP tools to keep the agent functional
+        except BaseException as e:  # noqa: BLE001 – broad catch is intentional to keep agent alive
+            # Ignore keyboard interrupts/system exits – re-raise those.
+            if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                raise
+
+            # Summarise ExceptionGroup if present (Python ≥3.11)
+            if hasattr(e, "exceptions"):
+                first_exc = e.exceptions[0] if e.exceptions else e  # type: ignore[attr-defined]
+                logger.warning(
+                    "MCP server tool loading encountered exception group for agent '%s': %s. "
+                    "Continuing without those tools.",
+                    self.name,
+                    first_exc,
+                )
+            else:
+                logger.warning(
+                    "MCP server tools could not be loaded for agent '%s': %s. "
+                    "Continuing without those tools.",
+                    self.name,
+                    e,
+                )
 
     def _parse_llm_response_choice(self, choice: Any) -> Tuple[Optional[str], Any, List[Any]]:
         """Safely parse finish_reason, message, and tool_calls from an LLM response choice."""
@@ -1125,26 +1136,6 @@ class Agent(Generic[_ExpectedContentType]):
         repr_str += ")"
         
         return repr_str
-
-    async def cleanup(self) -> None:
-        """
-        Clean up agent resources, including MCP connections.
-        
-        This method is optional and provided for compatibility.
-        MCP connections are now managed automatically via context managers.
-        """
-        if self._mcp_manager:
-            await self._mcp_manager.cleanup()
-            logger.debug(f"Cleaned up MCP connections for agent '{self.name}'")
-        
-        # Track cleanup state
-        self._cleanup_called = True
-
-    def __del__(self):
-        """Cleanup when agent is garbage collected."""
-        # MCP connections are now managed automatically via context managers
-        # No warning needed since cleanup is automatic
-        pass
 
     async def _execute_tool_async(self, tool_name: str, tool_args: Dict) -> Any:
         """

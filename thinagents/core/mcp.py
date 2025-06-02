@@ -255,19 +255,21 @@ class MCPManager:
                             self._skip_until.pop(server_id, None)
 
                         except Exception as e:
-                            logger.error(f"Failed to load tools from MCP server {server_id}: {e}", exc_info=True)
-
-                            self._failure_counts[server_id] = self._failure_counts.get(server_id, 0) + 1
-                            if self._failure_counts[server_id] >= self._failure_threshold:
-                                self._skip_until[server_id] = time.time() + self._backoff_seconds
-                                logger.warning(
-                                    f"MCP server {server_id} failed {self._failure_counts[server_id]} times — backing off for {self._backoff_seconds}s."
-                                )
-                            continue
-                                            
+                            logger.warning(
+                                "Failed to load tools from MCP server %s (config=%s): %s. Skipping but continuing with other servers.",
+                                server_id,
+                                server_config,
+                                e,
+                            )
 
             except Exception as e:
-                logger.error(f"Failed to connect to MCP server {server_id}: {e}", exc_info=True)
+                # Connection failure – log as warning without full traceback to keep logs clean.
+                logger.warning(
+                    "Failed to connect to MCP server %s (config=%s): %s. Skipping this server.",
+                    server_id,
+                    server_config,
+                    e,
+                )
 
                 # Increment failure count and maybe back-off
                 self._failure_counts[server_id] = self._failure_counts.get(server_id, 0) + 1
