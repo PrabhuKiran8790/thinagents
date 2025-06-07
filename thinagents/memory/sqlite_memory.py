@@ -16,15 +16,21 @@ class SQLiteMemory(BaseMemory):
     dictionaries themselves.
     """
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, table_name: str = "main"):
         """
         Initialize SQLiteMemory.
 
         Args:
             db_path: Path to the SQLite database file. 
                      If ":memory:", an in-memory database will be used.
+            table_name: Prefix for table names. Tables will be named 
+                       '{table_name}_conversations' and '{table_name}_messages'.
+                       Defaults to "main".
         """
         self.db_path = db_path
+        self.table_name = table_name
+        self.conversations_table = f"{table_name}_conversations"
+        self.messages_table = f"{table_name}_messages"
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -39,31 +45,31 @@ class SQLiteMemory(BaseMemory):
         with self._get_connection() as conn:
             cursor = conn.cursor()
             
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS conversations (
+            cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self.conversations_table} (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 conversation_id TEXT UNIQUE NOT NULL
             )
             """)
             
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
+            cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self.messages_table} (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 conversation_ref_id INTEGER NOT NULL,
                 message_json TEXT NOT NULL,
                 timestamp TEXT,  -- Store as ISO format string, from message content for ordering
-                FOREIGN KEY (conversation_ref_id) REFERENCES conversations (id) ON DELETE CASCADE
+                FOREIGN KEY (conversation_ref_id) REFERENCES {self.conversations_table} (id) ON DELETE CASCADE
             )
             """)
             
-            cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_conversations_conversation_id ON conversations (conversation_id);
+            cursor.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_{self.conversations_table}_conversation_id ON {self.conversations_table} (conversation_id);
             """)
-            cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_messages_conversation_ref_id ON messages (conversation_ref_id);
+            cursor.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_{self.messages_table}_conversation_ref_id ON {self.messages_table} (conversation_ref_id);
             """)
-            cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages (timestamp);
+            cursor.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_{self.messages_table}_timestamp ON {self.messages_table} (timestamp);
             """)
             conn.commit()
 
@@ -71,12 +77,12 @@ class SQLiteMemory(BaseMemory):
         """Get the internal DB ID for a conversation_id. Optionally create if not found."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT id FROM conversations WHERE conversation_id = ?", (conversation_id,))
+            cursor.execute(f"SELECT id FROM {self.conversations_table} WHERE conversation_id = ?", (conversation_id,))
             row = cursor.fetchone()
             if row:
                 return row[0]
             elif create_if_not_exists:
-                cursor.execute("INSERT INTO conversations (conversation_id) VALUES (?)", (conversation_id,))
+                cursor.execute(f"INSERT INTO {self.conversations_table} (conversation_id) VALUES (?)", (conversation_id,))
                 conn.commit()
                 return cursor.lastrowid
             return None
@@ -102,7 +108,7 @@ class SQLiteMemory(BaseMemory):
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO messages (conversation_ref_id, message_json, timestamp) VALUES (?, ?, ?)",
+                f"INSERT INTO {self.messages_table} (conversation_ref_id, message_json, timestamp) VALUES (?, ?, ?)",
                 (conv_db_id, message_json, msg_timestamp_str)
             )
             conn.commit()
@@ -123,7 +129,7 @@ class SQLiteMemory(BaseMemory):
             # Order by our stored timestamp (extracted from message), then by message ID for stable sort.
             # NULL timestamps will typically sort first in ASC order with SQLite.
             cursor.execute(
-                "SELECT message_json FROM messages WHERE conversation_ref_id = ? ORDER BY timestamp ASC, id ASC",
+                f"SELECT message_json FROM {self.messages_table} WHERE conversation_ref_id = ? ORDER BY timestamp ASC, id ASC",
                 (conv_db_id,)
             )
             for row in cursor.fetchall():
@@ -136,7 +142,7 @@ class SQLiteMemory(BaseMemory):
     def clear_conversation(self, conversation_id: str) -> None:
         """
         Clear all messages for a specific conversation.
-        The conversation entry itself in the 'conversations' table is not removed,
+        The conversation entry itself in the conversations table is not removed,
         allowing the conversation_id to remain listed.
         """
         conv_db_id = self._get_conversation_db_id(conversation_id, create_if_not_exists=False)
@@ -146,7 +152,7 @@ class SQLiteMemory(BaseMemory):
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM messages WHERE conversation_ref_id = ?", (conv_db_id,))
+            cursor.execute(f"DELETE FROM {self.messages_table} WHERE conversation_ref_id = ?", (conv_db_id,))
             conn.commit()
             logger.info(f"Cleared all messages for conversation ID '{conversation_id}' (DB ID: {conv_db_id}).")
 
@@ -157,6 +163,6 @@ class SQLiteMemory(BaseMemory):
         ids_list: List[str] = []
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT conversation_id FROM conversations ORDER BY conversation_id ASC")
+            cursor.execute(f"SELECT conversation_id FROM {self.conversations_table} ORDER BY conversation_id ASC")
             ids_list.extend(row[0] for row in cursor.fetchall())
         return ids_list

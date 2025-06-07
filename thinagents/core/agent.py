@@ -594,6 +594,7 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         stream: Literal[False] = False,
         stream_intermediate_steps: bool = False,
+        structured_tool_streaming: bool = False,
         conversation_id: Optional[str] = None,
     ) -> ThinagentResponse[_ExpectedContentType]:
         ...
@@ -603,6 +604,7 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         stream: Literal[True],
         stream_intermediate_steps: bool = False,
+        structured_tool_streaming: bool = False,
         conversation_id: Optional[str] = None,
     ) -> Iterator[ThinagentResponseStream[Any]]:
         ...
@@ -611,6 +613,7 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         stream: bool = False,
         stream_intermediate_steps: bool = False,
+        structured_tool_streaming: bool = False,
         conversation_id: Optional[str] = None,
     ) -> Any:
         """
@@ -620,6 +623,9 @@ class Agent(Generic[_ExpectedContentType]):
             input: The user's input message to the agent.
             stream: If True, returns a stream of responses instead of a single response.
             stream_intermediate_steps: If True and stream=True, also stream intermediate tool calls and results.
+            structured_tool_streaming: If True and stream_intermediate_steps=True, returns structured 
+                dictionaries for tool calls/results instead of simple strings. Defaults to False for 
+                backward compatibility.
             conversation_id: Optional conversation ID for memory retrieval
 
         Returns:
@@ -644,7 +650,7 @@ class Agent(Generic[_ExpectedContentType]):
         if stream:
             if self.response_format_model_type:
                 raise ValueError("Streaming is not supported when response_format is specified.")
-            return self._run_stream(input, stream_intermediate_steps, conversation_id)
+            return self._run_stream(input, stream_intermediate_steps, structured_tool_streaming, conversation_id)
 
         try:
             return self._run_sync(input, conversation_id)
@@ -840,6 +846,7 @@ class Agent(Generic[_ExpectedContentType]):
         self,
         input: str,
         stream_intermediate_steps: bool = False,
+        structured_tool_streaming: bool = False,
         conversation_id: Optional[str] = None,
     ) -> Iterator[ThinagentResponseStream[Any]]:
         """
@@ -1011,9 +1018,25 @@ class Agent(Generic[_ExpectedContentType]):
                 return
             
             if call_name:
+                # Parse arguments first for both streaming and execution
+                try:
+                    parsed_args = json.loads(call_args) if call_args else {}
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse tool arguments: {e}")
+                    parsed_args = {}
+                
                 if stream_intermediate_steps:
+                    if structured_tool_streaming:
+                        tool_call_content: Union[Dict[str, Any], str] = {
+                            "tool_name": call_name,
+                            "args": parsed_args,
+                            "status": "calling"
+                        }
+                    else:
+                        tool_call_content = f"<tool_call:{call_name}>"
+                        
                     yield ThinagentResponseStream(
-                        content=f"<tool_call:{call_name}>",
+                        content=tool_call_content,
                         content_type="tool_call",
                         tool_name=call_name,
                         tool_call_id=call_id or f"call_{call_name}",
@@ -1027,18 +1050,14 @@ class Agent(Generic[_ExpectedContentType]):
                         stream_options=None,
                     )
                 
-                # Parse arguments and execute tool
-                try:
-                    parsed_args = json.loads(call_args) if call_args else {}
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse tool arguments: {e}")
-                    parsed_args = {}
-                    
+                # Execute tool
                 try:
                     tool_result = self._execute_tool(call_name, parsed_args)
+                    execution_status = "completed"
                 except ToolExecutionError as e:
                     logger.error(f"Tool execution failed in stream: {e}")
                     tool_result = {"error": str(e), "message": "Tool execution failed"}
+                    execution_status = "error"
                 
                 # determine if the tool returned artifact along with content
                 tool_obj = self.tool_maps.get(call_name)
@@ -1048,13 +1067,25 @@ class Agent(Generic[_ExpectedContentType]):
                     content_value, artifact_payload = tool_result
                     self._tool_artifacts[call_name] = artifact_payload
                     serialised_content = self._process_tool_call_result(content_value)
+                    raw_result = content_value
                 else:
                     serialised_content = self._process_tool_call_result(tool_result)
+                    raw_result = tool_result
 
                 # Optionally emit tool result with artifact (only for tool_result chunks and finish_reason==tool_calls)
                 if stream_intermediate_steps:
+                    if structured_tool_streaming:
+                        tool_result_content: Union[Dict[str, Any], str] = {
+                            "tool_name": call_name,
+                            "args": parsed_args,
+                            "result": raw_result,
+                            "status": execution_status
+                        }
+                    else:
+                        tool_result_content = serialised_content
+                        
                     yield ThinagentResponseStream(
-                        content=serialised_content,
+                        content=tool_result_content,
                         content_type="tool_result",
                         tool_name=call_name,
                         tool_call_id=call_id or f"call_{call_name}",
@@ -1339,6 +1370,7 @@ class Agent(Generic[_ExpectedContentType]):
         self,
         input: str,
         stream_intermediate_steps: bool = False,
+        structured_tool_streaming: bool = False,
         conversation_id: Optional[str] = None,
     ) -> AsyncIterator[ThinagentResponseStream[Any]]:
         logger.info(f"Agent '{self.name}' starting async streaming execution")
@@ -1504,9 +1536,25 @@ class Agent(Generic[_ExpectedContentType]):
                 return
 
             if call_name:
+                # Parse arguments first for both streaming and execution
+                try:
+                    parsed_args = json.loads(call_args) if call_args else {}
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse tool arguments: {e}")
+                    parsed_args = {}
+
                 if stream_intermediate_steps:
+                    if structured_tool_streaming:
+                        tool_call_content: Union[Dict[str, Any], str] = {
+                            "tool_name": call_name,
+                            "args": parsed_args,
+                            "status": "calling"
+                        }
+                    else:
+                        tool_call_content = f"<tool_call:{call_name}>"
+                        
                     yield ThinagentResponseStream(
-                        content=f"<tool_call:{call_name}>",
+                        content=tool_call_content,
                         content_type="tool_call",
                         tool_name=call_name,
                         tool_call_id=call_id or f"call_{call_name}",
@@ -1520,17 +1568,14 @@ class Agent(Generic[_ExpectedContentType]):
                         stream_options=None,
                     )
 
-                try:
-                    parsed_args = json.loads(call_args) if call_args else {}
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse tool arguments: {e}")
-                    parsed_args = {}
-
+                # Execute tool
                 try:
                     tool_result = await self._execute_tool_async(call_name, parsed_args)
+                    execution_status = "completed"
                 except ToolExecutionError as e:
                     logger.error(f"Tool execution failed in async stream: {e}")
                     tool_result = {"error": str(e), "message": "Tool execution failed"}
+                    execution_status = "error"
 
                 tool_obj = self.tool_maps.get(call_name)
                 return_type = getattr(tool_obj, "return_type", "content")
@@ -1539,12 +1584,24 @@ class Agent(Generic[_ExpectedContentType]):
                     content_value, artifact_payload = tool_result
                     self._tool_artifacts[call_name] = artifact_payload
                     serialised_content = self._process_tool_call_result(content_value)
+                    raw_result = content_value
                 else:
                     serialised_content = self._process_tool_call_result(tool_result)
+                    raw_result = tool_result
 
                 if stream_intermediate_steps:
+                    if structured_tool_streaming:
+                        tool_result_content: Union[Dict[str, Any], str] = {
+                            "tool_name": call_name,
+                            "args": parsed_args,
+                            "result": raw_result,
+                            "status": execution_status
+                        }
+                    else:
+                        tool_result_content = serialised_content
+                        
                     yield ThinagentResponseStream(
-                        content=serialised_content,
+                        content=tool_result_content,
                         content_type="tool_result",
                         tool_name=call_name,
                         tool_call_id=call_id or f"call_{call_name}",
@@ -1613,6 +1670,7 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         stream: Literal[False] = False,
         stream_intermediate_steps: bool = False,
+        structured_tool_streaming: bool = False,
         conversation_id: Optional[str] = None,
     ) -> ThinagentResponse[_ExpectedContentType]: ...
 
@@ -1622,6 +1680,7 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         stream: Literal[True],
         stream_intermediate_steps: bool = False,
+        structured_tool_streaming: bool = False,
         conversation_id: Optional[str] = None,
     ) -> AsyncIterator[ThinagentResponseStream[Any]]: ...
 
@@ -1630,6 +1689,7 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         stream: bool = False,
         stream_intermediate_steps: bool = False,
+        structured_tool_streaming: bool = False,
         conversation_id: Optional[str] = None,
     ) -> Any:
         if not input or not isinstance(input, str):
@@ -1640,7 +1700,7 @@ class Agent(Generic[_ExpectedContentType]):
         if stream:
             if self.response_format_model_type:
                 raise ValueError("Streaming is not supported when response_format is specified.")
-            return self._run_stream_async(input, stream_intermediate_steps, conversation_id)
+            return self._run_stream_async(input, stream_intermediate_steps, structured_tool_streaming, conversation_id)
 
         return await self._run_async(input, conversation_id)
 
@@ -1649,12 +1709,30 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         *,
         stream_intermediate_steps: bool = False,
+        structured_tool_streaming: bool = False,
         conversation_id: Optional[str] = None,
     ) -> AsyncIterator[ThinagentResponseStream[Any]]:
+        """
+        Stream the response from the agent.
+
+        Args:
+            input: The input to the agent.
+            stream_intermediate_steps: Whether to stream intermediate steps.
+            structured_tool_streaming: If True and stream_intermediate_steps=True, returns structured 
+                dictionaries for tool calls/results instead of simple strings. Defaults to False for 
+                backward compatibility.
+            conversation_id: The conversation ID.
+
+        Usage:
+        ```python
+        async for chunk in agent.astream(...):
+            print(chunk.content)
+        ```
+        """
 
         if self.response_format_model_type:
             raise ValueError("Streaming is not supported when response_format is specified.")
-        return self._run_stream_async(input, stream_intermediate_steps, conversation_id)
+        return self._run_stream_async(input, stream_intermediate_steps, structured_tool_streaming, conversation_id)
 
     def _build_messages_with_memory(self, input: str, conversation_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
