@@ -75,10 +75,5 @@ logs/
 
 
 # everything in the tests folder
-<<<<<<< HEAD
 tests/*
-=======
-tests/*
-
-thinagents_docs/*
->>>>>>> bad8fae (something's wrong)
+examples/*
