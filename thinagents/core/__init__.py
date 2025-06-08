@@ -10,5 +10,6 @@ from thinagents.core.agent import Agent
 from thinagents.core.response_models import ThinagentResponse
 from thinagents.memory import BaseMemory, InMemoryStore, FileMemory, ConversationInfo
 from thinagents.core.mcp import MCPServerConfig
+from thinagents.core.workflow import Workflow
 
-__all__ = ["tool", "Agent", "ThinagentResponse", "BaseMemory", "InMemoryStore", "FileMemory", "ConversationInfo", "MCPServerConfig"]
+__all__ = ["tool", "Agent", "ThinagentResponse", "BaseMemory", "InMemoryStore", "FileMemory", "ConversationInfo", "MCPServerConfig", "Workflow"]

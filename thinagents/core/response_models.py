@@ -1,4 +1,4 @@
-from typing import Any, Optional, TypeVar, Generic
+from typing import Any, Optional, TypeVar, Generic, Dict, List
 from pydantic import BaseModel, Field, ConfigDict
 
 
@@ -34,6 +34,13 @@ class UsageMetrics(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+class WorkflowData(BaseModel):
+    """Data structure for workflow-specific information."""
+    agent_responses: Optional[Dict[str, List['ThinagentResponse']]] = Field(None, description="Dictionary mapping agent names to their full ThinagentResponse objects.")
+    
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="ignore")
+
+
 class ThinagentResponse(BaseModel, Generic[_ContentType]):
     content: _ContentType
     content_type: str = Field(description="Indicates the name of the Pydantic model in 'content' or 'str'.")
@@ -46,6 +53,8 @@ class ThinagentResponse(BaseModel, Generic[_ContentType]):
     artifact: Optional[Any] = Field(None, description="For any additional data from the LLM provider not covered by other fields. Defaults to None.")
     tool_name: Optional[str] = Field(None, description="Name of the tool associated with this response chunk, if applicable.")
     tool_call_id: Optional[str] = Field(None, description="Unique identifier of the tool call that produced this chunk, if applicable.")
+    agent_name: Optional[str] = Field(None, description="Name of the agent that generated this response, if applicable.")
+    workflow: Optional[WorkflowData] = Field(default=None, description="Workflow-specific data including agent responses.")
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="ignore")
 
 

@@ -777,6 +777,7 @@ class Agent(Generic[_ExpectedContentType]):
             artifact=self._tool_artifacts,
             tool_name=None,
             tool_call_id=None,
+            agent_name=self.name,
         )
 
     def _handle_tool_calls(self, tool_calls: List[Any], message: Any, messages: List[Dict], conversation_id: Optional[str] = None) -> None:
@@ -895,6 +896,7 @@ class Agent(Generic[_ExpectedContentType]):
                             system_fingerprint=None,
                             artifact=None,
                             stream_options=opts,
+                            agent_name=self.name,
                         )
                         continue
                         
