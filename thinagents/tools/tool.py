@@ -62,6 +62,7 @@ with contextlib.suppress(ImportError):
 @runtime_checkable
 class ThinAgentsTool(Protocol[P, R]):
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R: ...
+    async def __acall__(self, *args: P.args, **kwargs: P.kwargs) -> R: ...
     def tool_schema(self) -> Dict[str, Any]: ...
 
     __name__: str
@@ -277,7 +278,7 @@ def map_type_to_schema(py_type: Any) -> JSONSchemaType:
         return map_type_to_schema(args[0]) if args else {}
 
     if py_type is Any:
-        logger.debug(f"Mapping 'Any' type to empty schema.")
+        logger.debug("Mapping 'Any' type to empty schema.")
         return {}
 
     if isinstance(py_type, TypeVar):
@@ -293,6 +294,56 @@ def map_type_to_schema(py_type: Any) -> JSONSchemaType:
 
     logger.warning(f"No specific schema handler for type {py_type}. Defaulting to 'object'.")
     return {"type": "object"}
+
+
+def generate_param_schema(
+    name: str, param: inspect.Parameter, annotation: Any
+) -> JSONSchemaType:
+    """
+    Generate a JSON schema for a function parameter, including type, title, description, and default value.
+    """
+    base_type = annotation
+    param_description_from_annotated: Optional[str] = None
+
+    if get_origin(annotation) is Annotated:
+        actual_type, *metadata = get_args(annotation)
+        base_type = actual_type
+        param_description_from_annotated = next(
+            (m for m in metadata if isinstance(m, str) and not m.startswith(":")),
+            None,
+        )
+
+    core_type_schema = map_type_to_schema(base_type)
+    param_final_schema = core_type_schema.copy()  # Start with base schema
+
+    param_final_schema["title"] = name.replace("_", " ").capitalize()
+
+    if param_description_from_annotated:
+        param_final_schema["description"] = param_description_from_annotated
+    if param.default is not inspect.Parameter.empty:
+        param_final_schema["default"] = param.default
+
+    return param_final_schema
+
+
+def is_required_parameter(param: inspect.Parameter, annotation: Any) -> bool:
+    """
+    Determine if a function parameter is required based on its default value and type annotation.
+    """
+    if param.default is not inspect.Parameter.empty:
+        return False
+    current_type_to_check = annotation
+    if get_origin(current_type_to_check) is Annotated:
+        args = get_args(current_type_to_check)
+        if args:
+            current_type_to_check = args[0]
+
+    origin = get_origin(current_type_to_check)
+    args = get_args(current_type_to_check)
+
+    return (origin is not Union or type(None) not in args) and (
+        origin is Union or origin is not Optional
+    )
 
 
 def tool(
@@ -363,7 +414,7 @@ def tool(
         func_param_names = list(sig.parameters.keys())
         func_required = [
             name for name, param in sig.parameters.items()
-            if _is_required_parameter(param, param.annotation if param.annotation is not inspect.Parameter.empty else Any)
+            if is_required_parameter(param, param.annotation if param.annotation is not inspect.Parameter.empty else Any)
         ]
         schema_properties = list(schema_dict.get("properties", {}).keys())
         schema_required = list(schema_dict.get("required", []))
@@ -414,9 +465,9 @@ def tool(
                 annotation = type_hints.get(name, param.annotation)
                 if annotation is inspect.Parameter.empty:
                     annotation = Any
-                param_def = _generate_param_schema(name, param, annotation)
+                param_def = generate_param_schema(name, param, annotation)
                 generated_params_schema["properties"][name] = param_def  # type: ignore
-                if _is_required_parameter(param, annotation):
+                if is_required_parameter(param, annotation):
                     generated_params_schema["required"].append(name)
             generated_params_schema["required"] = sorted(list(set(generated_params_schema["required"])))
             params_schema = generated_params_schema
@@ -435,53 +486,3 @@ def tool(
     wrapper.__name__ = tool_name
 
     return wrapper  # type: ignore
-
-
-def _generate_param_schema(
-    name: str, param: inspect.Parameter, annotation: Any
-) -> JSONSchemaType:
-    """
-    Generate a JSON schema for a function parameter, including type, title, description, and default value.
-    """
-    base_type = annotation
-    param_description_from_annotated: Optional[str] = None
-
-    if get_origin(annotation) is Annotated:
-        actual_type, *metadata = get_args(annotation)
-        base_type = actual_type
-        param_description_from_annotated = next(
-            (m for m in metadata if isinstance(m, str) and not m.startswith(":")),
-            None,
-        )
-
-    core_type_schema = map_type_to_schema(base_type)
-    param_final_schema = core_type_schema.copy()  # Start with base schema
-
-    param_final_schema["title"] = name.replace("_", " ").capitalize()
-
-    if param_description_from_annotated:
-        param_final_schema["description"] = param_description_from_annotated
-    if param.default is not inspect.Parameter.empty:
-        param_final_schema["default"] = param.default
-
-    return param_final_schema
-
-
-def _is_required_parameter(param: inspect.Parameter, annotation: Any) -> bool:
-    """
-    Determine if a function parameter is required based on its default value and type annotation.
-    """
-    if param.default is not inspect.Parameter.empty:
-        return False
-    current_type_to_check = annotation
-    if get_origin(current_type_to_check) is Annotated:
-        args = get_args(current_type_to_check)
-        if args:
-            current_type_to_check = args[0]
-
-    origin = get_origin(current_type_to_check)
-    args = get_args(current_type_to_check)
-
-    return (origin is not Union or type(None) not in args) and (
-        origin is Union or origin is not Optional
-    )

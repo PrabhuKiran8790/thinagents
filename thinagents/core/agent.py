@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 import litellm
 from litellm import completion as litellm_completion
 from pydantic import BaseModel, ValidationError # type: ignore
-from thinagents.core.tool import ThinAgentsTool, tool as tool_decorator
+from thinagents.tools.tool import ThinAgentsTool, tool as tool_decorator
 from thinagents.memory import BaseMemory, ConversationInfo
 from thinagents.utils.prompts import PromptConfig
 from thinagents.core.response_models import (
@@ -1147,8 +1147,17 @@ class Agent(Generic[_ExpectedContentType]):
 
         try:
             logger.debug(f"Executing tool '{tool_name}' (async context) with args: {tool_args}")
-            if getattr(tool, "is_async_tool", False):
-                # Execute async tool directly, with timeout
+
+            # Prefer native async execution via __acall__ if available (e.g., for LangchainTool)
+            if hasattr(tool, "__acall__"):
+                try:
+                    return await asyncio.wait_for(tool.__acall__(**tool_args), timeout=self.tool_timeout)
+                except asyncio.TimeoutError as e:
+                    logger.error(f"Async tool '{tool_name}' execution timed out after {self.tool_timeout}s")
+                    raise ToolExecutionError(f"Async tool '{tool_name}' execution timed out") from e
+            
+            # Fallback for other async tools
+            elif getattr(tool, "is_async_tool", False):
                 try:
                     result = await asyncio.wait_for(tool(**tool_args), timeout=self.tool_timeout)
                     logger.debug(f"Async tool '{tool_name}' executed successfully")
@@ -1156,6 +1165,8 @@ class Agent(Generic[_ExpectedContentType]):
                 except asyncio.TimeoutError as e:
                     logger.error(f"Async tool '{tool_name}' execution timed out after {self.tool_timeout}s")
                     raise ToolExecutionError(f"Async tool '{tool_name}' execution timed out") from e
+            
+            # For sync tools, run in a thread
             else:
                 # Execute sync tool in a thread using asyncio.to_thread.
                 # Timeout is handled by asyncio.wait_for.
