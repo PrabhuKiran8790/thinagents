@@ -17,7 +17,7 @@ class AgnoIntegrationError(Exception):
     pass
 
 
-class AgnoToolkitAdapter:
+class AgnoTool:
     """
     Adapter to integrate Agno Toolkits with ThinAgents.
 
