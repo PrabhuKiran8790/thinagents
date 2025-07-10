@@ -1,18 +1,21 @@
 from typing import List, Callable, Any
 
 try:
-    from agno.tools import Toolkit as AgnoToolkit
+    from agno.tools import Toolkit as AgnoToolkit  # type: ignore
     AGNO_AVAILABLE = True
 except ImportError:
     AGNO_AVAILABLE = False
     # Create a dummy Toolkit class for type hinting if agno is not installed.
-    class AgnoToolkit: # type: ignore
+    class AgnoToolkit:  # type: ignore
         def __init__(self, *args: Any, **kwargs: Any):
             self.tools: List[Callable] = []
 
+
 class AgnoIntegrationError(Exception):
     """Custom exception for Agno integration errors."""
+
     pass
+
 
 class AgnoToolkitAdapter:
     """
@@ -22,30 +25,35 @@ class AgnoToolkitAdapter:
     method to extract the individual tool functions in a format that can be
     consumed directly by the thinagents.Agent.
     """
-    def __init__(self, toolkit: AgnoToolkit):
+
+    def __init__(self, toolkit: Any):
         """
-        Initializes the adapter with an Agno Toolkit instance.
+        Initializes the adapter with a toolkit instance.
 
         Args:
-            toolkit: An initialized instance of a class that inherits from agno.tools.Toolkit.
+            toolkit: An initialized toolkit object that provides a 'tools' attribute as a list of callables.
 
         Raises:
-            AgnoIntegrationError: If the 'agno' library is not installed.
-            TypeError: If the provided object is not an instance of agno.tools.Toolkit.
+            AgnoIntegrationError: If an agno toolkit is used but the 'agno' library is not installed.
+            AttributeError: If the provided object does not have a 'tools' attribute.
         """
-        if not AGNO_AVAILABLE:
-            raise AgnoIntegrationError("The 'agno' library is required to use Agno toolkits. Please install it with 'pip install agno'.")
+        is_likely_agno = "agno" in str(type(toolkit)).lower()
+        if is_likely_agno and not AGNO_AVAILABLE:
+            raise AgnoIntegrationError(
+                "The 'agno' library is required to use Agno toolkits. Please install it with 'pip install agno'."
+            )
 
-        if not isinstance(toolkit, AgnoToolkit):
-            raise TypeError(f"Expected an instance of agno.tools.Toolkit, but got {type(toolkit).__name__}.")
+        if not hasattr(toolkit, "tools") or not isinstance(
+            getattr(toolkit, "tools"), list
+        ):
+            raise AttributeError(
+                "The provided toolkit object does not have a valid 'tools' attribute containing a list of methods."
+            )
 
-        if not hasattr(toolkit, "tools") or not isinstance(getattr(toolkit, "tools"), list):
-            raise AttributeError("The provided toolkit object does not have a valid 'tools' attribute containing a list of methods.")
-            
         self._toolkit = toolkit
 
     def get_tools(self) -> List[Callable]:
         """
-        Returns the list of callable tool functions from the Agno Toolkit.
+        Returns the list of callable tool functions from the toolkit.
         """
         return self._toolkit.tools 
