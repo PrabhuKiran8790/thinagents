@@ -360,7 +360,7 @@ class Agent(Generic[_ExpectedContentType]):
             logger.error(f"Tool '{tool_name}' execution failed: {e}")
             raise ToolExecutionError(f"Tool '{tool_name}' execution failed: {e}") from e
 
-    def _build_system_prompt(self) -> str:
+    def _build_system_prompt(self, prompt_vars: Optional[Dict[str, Any]] = None) -> str:
         """Build the system prompt for the agent."""
         if isinstance(self.prompt, PromptConfig):
             prompt_config = self.prompt
@@ -382,7 +382,7 @@ class Agent(Generic[_ExpectedContentType]):
                         f"Instructions for sub-agent {sa.name}", sa.instructions
                 )
         
-        return prompt_config.build()
+        return prompt_config.build(**(prompt_vars or {}))
 
     def _extract_usage_metrics(self, response: Any) -> Optional[UsageMetrics]:
         """Extract usage metrics from LLM response."""
@@ -595,6 +595,7 @@ class Agent(Generic[_ExpectedContentType]):
         stream: Literal[False] = False,
         stream_intermediate_steps: bool = False,
         conversation_id: Optional[str] = None,
+        prompt_vars: Optional[Dict[str, Any]] = None,
     ) -> ThinagentResponse[_ExpectedContentType]:
         ...
     @overload
@@ -604,6 +605,7 @@ class Agent(Generic[_ExpectedContentType]):
         stream: Literal[True],
         stream_intermediate_steps: bool = False,
         conversation_id: Optional[str] = None,
+        prompt_vars: Optional[Dict[str, Any]] = None,
     ) -> Iterator[ThinagentResponseStream[Any]]:
         ...
     def run(
@@ -612,6 +614,7 @@ class Agent(Generic[_ExpectedContentType]):
         stream: bool = False,
         stream_intermediate_steps: bool = False,
         conversation_id: Optional[str] = None,
+        prompt_vars: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """
         Run the agent with the given input and manage interactions with the language model and tools.
@@ -621,6 +624,7 @@ class Agent(Generic[_ExpectedContentType]):
             stream: If True, returns a stream of responses instead of a single response.
             stream_intermediate_steps: If True and stream=True, also stream intermediate tool calls and results.
             conversation_id: Optional conversation ID for memory retrieval
+            prompt_vars: Optional dictionary of variables to substitute into the prompt template.
 
         Returns:
             ThinagentResponse[_ExpectedContentType] when stream=False, or Iterator[ThinagentResponseStream] when stream=True.
@@ -644,10 +648,10 @@ class Agent(Generic[_ExpectedContentType]):
         if stream:
             if self.response_format_model_type:
                 raise ValueError("Streaming is not supported when response_format is specified.")
-            return self._run_stream(input, stream_intermediate_steps, conversation_id)
+            return self._run_stream(input, stream_intermediate_steps, conversation_id, prompt_vars=prompt_vars)
 
         try:
-            return self._run_sync(input, conversation_id)
+            return self._run_sync(input, conversation_id, prompt_vars=prompt_vars)
         except Exception as e:
             logger.error(f"Agent '{self.name}' execution failed: {e}")
             if isinstance(e, (AgentError, MaxStepsExceededError)):
@@ -708,10 +712,10 @@ class Agent(Generic[_ExpectedContentType]):
         logger.warning(f"Agent '{self.name}' reached max steps ({self.max_steps})")
         raise MaxStepsExceededError(f"Max steps ({self.max_steps}) reached without final answer.")
 
-    def _run_sync(self, input: str, conversation_id: Optional[str] = None) -> ThinagentResponse[_ExpectedContentType]:
+    def _run_sync(self, input: str, conversation_id: Optional[str] = None, prompt_vars: Optional[Dict[str, Any]] = None) -> ThinagentResponse[_ExpectedContentType]:
         """Synchronous execution of the agent."""
         self._tool_artifacts: dict[str, Any] = {}  # initialize storage for tool artifacts
-        messages = self._build_messages_with_memory(input, conversation_id)
+        messages = self._build_messages_with_memory(input, conversation_id, prompt_vars=prompt_vars)
         return self._run_loop(messages, conversation_id)
 
     def _handle_completion(
@@ -831,21 +835,22 @@ class Agent(Generic[_ExpectedContentType]):
         return isinstance(self.memory, InMemoryStore) and self.memory.store_tool_artifacts
 
     # Helper to prepare common streaming state
-    def _prepare_stream(self, input: str, conversation_id: Optional[str]) -> List[Dict[str, Any]]:
+    def _prepare_stream(self, input: str, conversation_id: Optional[str], prompt_vars: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """Initialize artifacts and build messages for streaming runs."""
         self._tool_artifacts = {}
-        return self._build_messages_with_memory(input, conversation_id)
+        return self._build_messages_with_memory(input, conversation_id, prompt_vars=prompt_vars)
 
     def _run_stream(
         self,
         input: str,
         stream_intermediate_steps: bool = False,
         conversation_id: Optional[str] = None,
+        prompt_vars: Optional[Dict[str, Any]] = None,
     ) -> Iterator[ThinagentResponseStream[Any]]:
         """
         Streamed version of run; yields ThinagentResponseStream chunks, including interleaved tool calls/results if requested.
         """
-        messages = self._prepare_stream(input, conversation_id)
+        messages = self._prepare_stream(input, conversation_id, prompt_vars=prompt_vars)
         logger.info(f"Agent '{self.name}' starting streaming execution")
         
         step_count = 0
@@ -1339,11 +1344,11 @@ class Agent(Generic[_ExpectedContentType]):
         logger.warning(f"Agent '{self.name}' reached max steps ({self.max_steps}) in async mode")
         raise MaxStepsExceededError(f"Max steps ({self.max_steps}) reached without final answer.")
 
-    async def _run_async(self, input: str, conversation_id: Optional[str] = None) -> ThinagentResponse[_ExpectedContentType]:
+    async def _run_async(self, input: str, conversation_id: Optional[str] = None, prompt_vars: Optional[Dict[str, Any]] = None) -> ThinagentResponse[_ExpectedContentType]:
         self._tool_artifacts = {}
         # Ensure MCP tools are loaded before proceeding
         await self._ensure_mcp_tools_loaded()
-        messages = self._build_messages_with_memory(input, conversation_id)
+        messages = self._build_messages_with_memory(input, conversation_id, prompt_vars=prompt_vars)
         return await self._run_loop_async(messages, conversation_id)
 
     async def _run_stream_async(
@@ -1351,12 +1356,13 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         stream_intermediate_steps: bool = False,
         conversation_id: Optional[str] = None,
+        prompt_vars: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[ThinagentResponseStream[Any]]:
         logger.info(f"Agent '{self.name}' starting async streaming execution")
 
         # Ensure MCP tools are loaded before proceeding
         await self._ensure_mcp_tools_loaded()
-        messages = self._prepare_stream(input, conversation_id)
+        messages = self._prepare_stream(input, conversation_id, prompt_vars=prompt_vars)
         accumulated_content = ""  # Track accumulated content for memory
 
         step_count = 0
@@ -1625,6 +1631,7 @@ class Agent(Generic[_ExpectedContentType]):
         stream: Literal[False] = False,
         stream_intermediate_steps: bool = False,
         conversation_id: Optional[str] = None,
+        prompt_vars: Optional[Dict[str, Any]] = None,
     ) -> ThinagentResponse[_ExpectedContentType]: ...
 
     @overload
@@ -1634,6 +1641,7 @@ class Agent(Generic[_ExpectedContentType]):
         stream: Literal[True],
         stream_intermediate_steps: bool = False,
         conversation_id: Optional[str] = None,
+        prompt_vars: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[ThinagentResponseStream[Any]]: ...
 
     async def arun(
@@ -1642,6 +1650,7 @@ class Agent(Generic[_ExpectedContentType]):
         stream: bool = False,
         stream_intermediate_steps: bool = False,
         conversation_id: Optional[str] = None,
+        prompt_vars: Optional[Dict[str, Any]] = None,
     ) -> Any:
         if not input or not isinstance(input, str):
             raise ValueError("Input must be a non-empty string")
@@ -1651,9 +1660,9 @@ class Agent(Generic[_ExpectedContentType]):
         if stream:
             if self.response_format_model_type:
                 raise ValueError("Streaming is not supported when response_format is specified.")
-            return self._run_stream_async(input, stream_intermediate_steps, conversation_id)
+            return self._run_stream_async(input, stream_intermediate_steps, conversation_id, prompt_vars=prompt_vars)
 
-        return await self._run_async(input, conversation_id)
+        return await self._run_async(input, conversation_id, prompt_vars=prompt_vars)
 
     def astream(
         self,
@@ -1661,19 +1670,21 @@ class Agent(Generic[_ExpectedContentType]):
         *,
         stream_intermediate_steps: bool = False,
         conversation_id: Optional[str] = None,
+        prompt_vars: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[ThinagentResponseStream[Any]]:
 
         if self.response_format_model_type:
             raise ValueError("Streaming is not supported when response_format is specified.")
-        return self._run_stream_async(input, stream_intermediate_steps, conversation_id)
+        return self._run_stream_async(input, stream_intermediate_steps, conversation_id, prompt_vars=prompt_vars)
 
-    def _build_messages_with_memory(self, input: str, conversation_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    def _build_messages_with_memory(self, input: str, conversation_id: Optional[str] = None, prompt_vars: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """
         Build messages list including memory history if available.
         
         Args:
             input: Current user input
             conversation_id: Optional conversation ID for memory retrieval
+            prompt_vars: Optional dictionary of variables to substitute into the prompt template.
             
         Returns:
             List of messages including system prompt, history, and current input
@@ -1681,7 +1692,7 @@ class Agent(Generic[_ExpectedContentType]):
         messages: List[Dict[str, Any]] = []
         
         # Add system prompt
-        system_prompt = self._build_system_prompt()
+        system_prompt = self._build_system_prompt(prompt_vars=prompt_vars)
         messages.append({"role": "system", "content": system_prompt})
         
         # Add conversation history from memory if available

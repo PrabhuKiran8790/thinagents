@@ -2,13 +2,21 @@
 This module contains the PromptConfig class, which is used to construct the prompt for the agent.
 """
 
-from typing import List, Optional, Tuple, Union
+import re
+from typing import List, Optional, Tuple, Union, Type
+from pydantic import BaseModel, ValidationError
+
 
 # SectionType defines the structure for individual sections that can be added to the prompt.
 # A section can be a 2-tuple (heading, content) or a 3-tuple (heading, content, extra_text).
 SectionType = Union[
     Tuple[str, Union[str, List[str]]], Tuple[str, Union[str, List[str]], Optional[str]]
 ]
+
+
+class PromptingError(ValueError):
+    """Custom exception for prompting-related errors, such as missing template variables."""
+    pass
 
 
 class PromptConfig:
@@ -48,19 +56,26 @@ class PromptConfig:
     instructions: Optional[List[str]]
     context: Optional[str]
     sections: Optional[List[Tuple[str, Union[str, List[str]], Optional[str]]]]
+    vars_schema: Optional[Type[BaseModel]]
     _field_order: List[str]
 
-    def __init__(self, base_prompt: str):
+    def __init__(self, base_prompt: str, *, vars_schema: Optional[Type[BaseModel]] = None):
         """
-        Initializes the PromptConfig with a base prompt.
+        Initializes the PromptConfig with a base prompt and an optional variable schema.
 
         Args:
             base_prompt (str): The base prompt for the agent.
+            vars_schema (Optional[Type[BaseModel]]): An optional Pydantic BaseModel class
+                to validate the variables passed to the `build` method.
         """
+        if vars_schema and not issubclass(vars_schema, BaseModel):
+            raise TypeError("vars_schema must be a Pydantic BaseModel subclass.")
+
         self.base_prompt = base_prompt
         self.instructions = None
         self.context = None
         self.sections = None
+        self.vars_schema = vars_schema
         self._field_order = []
 
     def _track_order(self, field: str):
@@ -212,39 +227,96 @@ class PromptConfig:
         self._track_order("sections")
         return self
 
-    def build(self) -> str:
+    def build(self, **kwargs) -> str:
         """
-        Constructs the final prompt string based on the added components.
+        Constructs the final prompt string based on the added components, with template substitution.
+
+        This method first validates that all required template variables (e.g., `{name}`)
+        are provided in the keyword arguments. If a `vars_schema` was provided during
+        initialization, it will be used for robust type and structure validation.
+        If any validation fails, it raises a `PromptingError`.
 
         The order of components (instructions, context, sections) in the output
         string is determined by the order in which their respective `with_` or `add_`
         methods were called. The base prompt always comes first.
+        
+        Example:
+            prompt = PromptConfig("Hello, {name}.")
+            prompt.build(name="World")  # Returns "Hello, World."
+
+        Args:
+            **kwargs: Keyword arguments for template substitution.
 
         Returns:
             str: The fully constructed prompt string.
+            
+        Raises:
+            PromptingError: If any required template variables are missing or fail schema validation.
         """
-        parts = [self.base_prompt.strip()]
+        # --- 1. Pydantic Schema Validation (if provided) ---
+        if self.vars_schema:
+            try:
+                self.vars_schema.model_validate(kwargs)
+            except ValidationError as e:
+                raise PromptingError(
+                    f"Prompt variables failed validation for schema '{self.vars_schema.__name__}':\n{e}"
+                ) from e
+
+        # --- 2. Validate that all required template variables are present ---
+        all_templates = [self.base_prompt]
+        if self.instructions:
+            all_templates.extend(self.instructions)
+        if self.context:
+            all_templates.append(self.context)
+        if self.sections:
+            for heading, content, extra_text in self.sections:
+                all_templates.append(heading)
+                if isinstance(content, list):
+                    all_templates.extend(content)
+                else:
+                    all_templates.append(str(content))
+                if extra_text:
+                    all_templates.append(extra_text)
+
+        required_vars = set()
+        for template in all_templates:
+            # Use regex to find all {variable} style placeholders
+            required_vars.update(re.findall(r'{(\w+)}', template))
+
+        provided_vars = set(kwargs.keys())
+        missing_vars = required_vars - provided_vars
+
+        if missing_vars:
+            raise PromptingError(
+                f"Missing required prompt variables: {sorted(list(missing_vars))}. "
+                "Please provide them in the `prompt_vars` argument of agent.run()."
+            )
+
+        # --- 3. Build the prompt string ---
+        parts = [self.base_prompt.strip().format(**kwargs)]
 
         for field_key in self._field_order:
             if field_key == "instructions" and self.instructions:
+                formatted_instructions = [i.format(**kwargs) for i in self.instructions]
                 instruction_block = ["Instructions:"]
-                instruction_block.extend(f"- {i}" for i in self.instructions)
+                instruction_block.extend(f"- {i}" for i in formatted_instructions)
                 parts.append("\n".join(instruction_block))
             elif field_key == "context" and self.context:
-                parts.append(f"Context:\n{self.context}")
+                formatted_context = self.context.format(**kwargs)
+                parts.append(f"Context:\n{formatted_context}")
             elif field_key == "sections" and self.sections:
                 for heading, content, extra_text in self.sections:
-                    section_lines = [f"{heading}:"]
+                    formatted_heading = heading.format(**kwargs)
+                    section_lines = [f"{formatted_heading}:"]
                     if isinstance(content, list):
-                        section_lines.extend(f"- {line}" for line in content)
+                        formatted_content_list = [line.format(**kwargs) for line in content]
+                        section_lines.extend(f"- {line}" for line in formatted_content_list)
                     else:
-                        section_lines.append(str(content))  # Ensure content is string
+                        formatted_content_str = str(content).format(**kwargs)
+                        section_lines.append(formatted_content_str)
                     if extra_text:
-                        # Ensure extra_text is string and add a newline if it's not empty.
-                        # The original code had f"\n{extra_text}", which is fine if extra_text
-                        # is meant to be a paragraph. If it's a short note, it might
-                        # depend on desired formatting. Keeping original logic.
-                        section_lines.append(f"\n{extra_text}")
+                        formatted_extra_text = extra_text.format(**kwargs)
+                        section_lines.append(f"\n{formatted_extra_text}")
                     parts.append("\n".join(section_lines))
 
         # Join all parts with double newlines, filtering out empty or whitespace-only parts.
