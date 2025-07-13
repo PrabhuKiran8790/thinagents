@@ -15,8 +15,9 @@ streamlined framework.
 from thinagents.core.agent import Agent
 from thinagents.utils.prompts import PromptConfig
 from thinagents.tools.tool import tool
+from thinagents.tools.toolkit import Toolkit
 from thinagents.core.response_models import ThinagentResponse
 from thinagents.core.mcp import MCPServerConfig
 
 
-__all__ = ["Agent", "PromptConfig", "tool", "ThinagentResponse", "MCPServerConfig"]
+__all__ = ["Agent", "PromptConfig", "tool", "Toolkit", "ThinagentResponse", "MCPServerConfig"]

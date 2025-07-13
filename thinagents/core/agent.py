@@ -6,11 +6,12 @@ import json
 import logging
 import asyncio
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union, Iterator, AsyncIterator, TypeVar, Generic, cast, overload, Literal
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+from concurrent.futures import TimeoutError
 import litellm
 from litellm import completion as litellm_completion
 from pydantic import BaseModel, ValidationError # type: ignore
 from thinagents.tools.tool import ThinAgentsTool, tool as tool_decorator
+from thinagents.tools.toolkit import Toolkit
 from thinagents.memory import BaseMemory, ConversationInfo
 from thinagents.utils.prompts import PromptConfig
 from thinagents.core.response_models import (
@@ -22,7 +23,6 @@ from thinagents.core.response_models import (
 )
 from thinagents.core.mcp import MCPManager, MCPServerConfig, normalize_mcp_servers
 from thinagents.utils.thread_pool_manager import (
-    ThreadPoolManager,
     ThreadPoolConfig,
     get_thread_pool_manager,
     execute_tool_in_thread,
@@ -58,13 +58,13 @@ class AsyncToolInSyncContextError(AgentError):
 
 
 def generate_tool_schemas(
-    tools: Union[List[ThinAgentsTool], List[Callable]],
+    tools: List[Union[ThinAgentsTool, Callable, Toolkit]],
 ) -> Tuple[List[Dict], Dict[str, ThinAgentsTool]]:
     """
     Generate JSON schemas for provided tools and return tool schemas list and tool maps.
 
     Args:
-        tools: A list of ThinAgentsTool instances or callables decorated with @tool.
+        tools: A list containing ThinAgentsTool instances, callables decorated with @tool, and/or Toolkit instances.
 
     Returns:
         Tuple[List[Dict], Dict[str, ThinAgentsTool]]: A list of tool schema dictionaries and a mapping from tool names to ThinAgentsTool instances.
@@ -77,23 +77,49 @@ def generate_tool_schemas(
 
     for tool in tools:
         try:
-            if isinstance(tool, ThinAgentsTool):
+            if isinstance(tool, Toolkit):
+                # Handle toolkit instances by extracting their tools
+                toolkit_tools = tool.get_tools()
+                for toolkit_tool in toolkit_tools:
+                    schema_data = toolkit_tool.tool_schema()
+                    tool_maps[toolkit_tool.__name__] = toolkit_tool
+                    
+                    # extract the actual OpenAI tool schema from our wrapper format
+                    if isinstance(schema_data, dict) and "tool_schema" in schema_data:
+                        # new format with return_type metadata
+                        actual_schema = schema_data["tool_schema"]
+                    else:
+                        # legacy format - direct schema
+                        actual_schema = schema_data
+                    
+                    tool_schemas.append(actual_schema)
+            elif isinstance(tool, ThinAgentsTool):
                 schema_data = tool.tool_schema()
                 tool_maps[tool.__name__] = tool
+                
+                # extract the actual OpenAI tool schema from our wrapper format
+                if isinstance(schema_data, dict) and "tool_schema" in schema_data:
+                    # new format with return_type metadata
+                    actual_schema = schema_data["tool_schema"]
+                else:
+                    # legacy format - direct schema
+                    actual_schema = schema_data
+                
+                tool_schemas.append(actual_schema)
             else:
                 _tool = tool_decorator(tool)
                 schema_data = _tool.tool_schema()
                 tool_maps[_tool.__name__] = _tool
-            
-            # extract the actual OpenAI tool schema from our wrapper format
-            if isinstance(schema_data, dict) and "tool_schema" in schema_data:
-                # new format with return_type metadata
-                actual_schema = schema_data["tool_schema"]
-            else:
-                # legacy format - direct schema
-                actual_schema = schema_data
-            
-            tool_schemas.append(actual_schema)
+                
+                # extract the actual OpenAI tool schema from our wrapper format
+                if isinstance(schema_data, dict) and "tool_schema" in schema_data:
+                    # new format with return_type metadata
+                    actual_schema = schema_data["tool_schema"]
+                else:
+                    # legacy format - direct schema
+                    actual_schema = schema_data
+                
+                tool_schemas.append(actual_schema)
         except Exception as e:
             logger.error(f"Failed to generate schema for tool {tool}: {e}")
             raise AgentError(f"Tool schema generation failed for {tool}: {e}") from e
@@ -124,7 +150,7 @@ class Agent(Generic[_ExpectedContentType]):
         api_key: Optional[str] = None,
         api_base: Optional[str] = None,
         api_version: Optional[str] = None,
-        tools: Optional[Union[List[ThinAgentsTool], List[Callable]]] = None,
+        tools: Optional[List[Union[ThinAgentsTool, Callable, Toolkit]]] = None,
         sub_agents: Optional[List["Agent"]] = None,
         prompt: Optional[Union[str, PromptConfig]] = None,
         instructions: Optional[List[str]] = None,
@@ -151,7 +177,7 @@ class Agent(Generic[_ExpectedContentType]):
             api_base: Optional base URL for the API, if using a custom or self-hosted model.
             api_version: Optional API version, required by some providers like Azure OpenAI.
             tools: A list of tools that the agent can use.
-                Tools can be instances of `ThinAgentsTool` or callable functions decorated with `@tool`.
+                Tools can be instances of `ThinAgentsTool`, callable functions decorated with `@tool`, or `Toolkit` instances.
             sub_agents: A list of `Agent` instances that should be exposed as tools to this
                 parent agent. Each sub-agent will be wrapped in a ThinAgents tool that takes a
                 single string parameter named `input` and returns the sub-agent's response. This
