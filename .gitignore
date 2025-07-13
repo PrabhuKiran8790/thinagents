@@ -26,6 +26,7 @@ env/
 ENV/
 .env
 .venv
+.venv_*
 env.bak/
 venv.bak/
 
@@ -75,10 +76,6 @@ logs/
 
 
 # everything in the tests folder
-<<<<<<< HEAD
 tests/*
-=======
-tests/*
-
+examples/*
 thinagents_docs/*
->>>>>>> bad8fae (something's wrong)

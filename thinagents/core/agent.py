@@ -21,6 +21,12 @@ from thinagents.core.response_models import (
     PromptTokensDetails,
 )
 from thinagents.core.mcp import MCPManager, MCPServerConfig, normalize_mcp_servers
+from thinagents.utils.thread_pool_manager import (
+    ThreadPoolManager,
+    ThreadPoolConfig,
+    get_thread_pool_manager,
+    execute_tool_in_thread,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +131,8 @@ class Agent(Generic[_ExpectedContentType]):
         propagate_subagent_instructions: bool = False,
         max_steps: int = DEFAULT_MAX_STEPS,
         concurrent_tool_execution: bool = True,
+        max_concurrent_tools: Optional[int] = None,
+        thread_pool_config: Optional[ThreadPoolConfig] = None,
         response_format: Optional[Type[_ExpectedContentType]] = None,
         enable_schema_validation: bool = True,
         description: Optional[str] = None,
@@ -157,9 +165,12 @@ class Agent(Generic[_ExpectedContentType]):
                 sequences the agent will perform before stopping. Defaults to 15.
             parallel_tool_calls: If True, allows the agent to request multiple tool calls
                 in a single step from the language model. Defaults to False.
-            concurrent_tool_execution: If True and `parallel_tool_calls` is also True,
-                the agent will execute multiple tool calls concurrently using a thread pool.
-                Defaults to True.
+            concurrent_tool_execution: If True, the agent will execute multiple tool calls
+                concurrently using a shared thread pool. Defaults to True.
+            max_concurrent_tools: Maximum number of tools that can be executed concurrently.
+                If not specified, uses the thread pool configuration default.
+            thread_pool_config: Configuration for the thread pool manager. If not provided,
+                uses default configuration.
             response_format: Configuration for enabling structured output from the model.
                 This should be a Pydantic model.
             enable_schema_validation: If True, enables schema validation for the response format.
@@ -198,6 +209,15 @@ class Agent(Generic[_ExpectedContentType]):
         self.propagate_subagent_instructions = propagate_subagent_instructions
 
         self.concurrent_tool_execution = concurrent_tool_execution
+        self.max_concurrent_tools = max_concurrent_tools
+        
+        # Initialize thread pool manager
+        self._thread_pool_config = thread_pool_config or ThreadPoolConfig()
+        if max_concurrent_tools is not None:
+            self._thread_pool_config.max_workers = max_concurrent_tools
+        self._thread_pool_manager = get_thread_pool_manager(self._thread_pool_config)
+        
+
         self.kwargs = kwargs
 
         self._provided_tools = tools or []
@@ -342,15 +362,15 @@ class Agent(Generic[_ExpectedContentType]):
             logger.debug(f"Executing tool '{tool_name}' with args: {tool_args}")
 
             if self.concurrent_tool_execution:
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(tool, **tool_args)
-                    try:
-                        result = future.result(timeout=self.tool_timeout)
-                        logger.debug(f"Tool '{tool_name}' executed successfully")
-                        return result
-                    except TimeoutError as e:
-                        logger.error(f"Tool '{tool_name}' execution timed out after {self.tool_timeout}s")
-                        raise ToolExecutionError(f"Tool '{tool_name}' execution timed out") from e
+                # Use the thread pool manager for efficient execution
+                future = self._thread_pool_manager.submit_tool_execution(tool, tool_args, self.tool_timeout)
+                try:
+                    result = future.result(timeout=self.tool_timeout)
+                    logger.debug(f"Tool '{tool_name}' executed successfully")
+                    return result
+                except TimeoutError as e:
+                    logger.error(f"Tool '{tool_name}' execution timed out after {self.tool_timeout}s")
+                    raise ToolExecutionError(f"Tool '{tool_name}' execution timed out") from e
             else:
                 result = tool(**tool_args)
                 logger.debug(f"Tool '{tool_name}' executed successfully")
@@ -716,6 +736,7 @@ class Agent(Generic[_ExpectedContentType]):
         """Synchronous execution of the agent."""
         self._tool_artifacts: dict[str, Any] = {}  # initialize storage for tool artifacts
         messages = self._build_messages_with_memory(input, conversation_id, prompt_vars=prompt_vars)
+        
         return self._run_loop(messages, conversation_id)
 
     def _handle_completion(
@@ -783,27 +804,39 @@ class Agent(Generic[_ExpectedContentType]):
 
         if tool_calls:
             if self.concurrent_tool_execution and len(tool_calls) > 1:
-                with ThreadPoolExecutor(max_workers=len(tool_calls)) as executor:
-                    futures = {
-                        executor.submit(self._execute_single_tool_call, tc): tc
-                        for tc in tool_calls
-                    }
-                    for future in as_completed(futures):
-                        try:
-                            result = future.result(timeout=self.tool_timeout)
-                            tool_call_outputs.append(result)
-                        except Exception as exc:
-                            failed_tc = futures[future]
-                            logger.error(f"Future for tool call {failed_tc.function.name} (ID: {failed_tc.id}) failed: {exc}")
+                # Use thread pool manager for concurrent execution
+                tool_call_funcs = [(self._execute_single_tool_call, {"tc": tc}) for tc in tool_calls]
+                
+                try:
+                    # Execute all tool calls concurrently
+                    results = self._thread_pool_manager.execute_tools_concurrently(
+                        [(func, args) for func, args in tool_call_funcs],
+                        timeout=self.tool_timeout,
+                        max_concurrent=self.max_concurrent_tools
+                    )
+                    
+                    # Process results
+                    for i, result in enumerate(results):
+                        if isinstance(result, Exception):
+                            failed_tc = tool_calls[i]
+                            logger.error(f"Tool call {failed_tc.function.name} (ID: {failed_tc.id}) failed: {result}")
                             tool_call_outputs.append({
                                 "tool_call_id": failed_tc.id,
                                 "role": "tool",
                                 "name": failed_tc.function.name,
                                 "content": json.dumps({
-                                    "error": str(exc),
+                                    "error": str(result),
                                     "message": "Failed to retrieve tool result from concurrent execution",
                                 }),
                             })
+                        else:
+                            tool_call_outputs.append(result)
+                except Exception as e:
+                    logger.error(f"Error in concurrent tool execution: {e}")
+                    # Fallback to sequential execution
+                    tool_call_outputs.extend(
+                        self._execute_single_tool_call(tc) for tc in tool_calls
+                    )
             else:
                 tool_call_outputs.extend(
                     self._execute_single_tool_call(tc) for tc in tool_calls
@@ -839,6 +872,11 @@ class Agent(Generic[_ExpectedContentType]):
         """Initialize artifacts and build messages for streaming runs."""
         self._tool_artifacts = {}
         return self._build_messages_with_memory(input, conversation_id, prompt_vars=prompt_vars)
+    
+    async def _aprepare_stream(self, input: str, conversation_id: Optional[str], prompt_vars: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Async version of _prepare_stream."""
+        self._tool_artifacts = {}
+        return await self._abuild_messages_with_memory(input, conversation_id, prompt_vars=prompt_vars)
 
     def _run_stream(
         self,
@@ -1141,6 +1179,8 @@ class Agent(Generic[_ExpectedContentType]):
         repr_str += ")"
         
         return repr_str
+    
+
 
     async def _execute_tool_async(self, tool_name: str, tool_args: Dict) -> Any:
         """
@@ -1171,18 +1211,17 @@ class Agent(Generic[_ExpectedContentType]):
                     logger.error(f"Async tool '{tool_name}' execution timed out after {self.tool_timeout}s")
                     raise ToolExecutionError(f"Async tool '{tool_name}' execution timed out") from e
             
-            # For sync tools, run in a thread
+            # For sync tools, use the thread pool manager for efficient execution
             else:
-                # Execute sync tool in a thread using asyncio.to_thread.
-                # Timeout is handled by asyncio.wait_for.
-                future = asyncio.to_thread(tool, **tool_args)
                 try:
-                    result = await asyncio.wait_for(future, timeout=self.tool_timeout)
-                    logger.debug(f"Sync tool '{tool_name}' executed successfully in thread")
+                    result = await execute_tool_in_thread(
+                        tool, tool_args, self.tool_timeout, self._thread_pool_manager
+                    )
+                    logger.debug(f"Sync tool '{tool_name}' executed successfully in thread pool")
                     return result
                 except asyncio.TimeoutError as e:
-                    logger.error(f"Sync tool '{tool_name}' execution (in thread) timed out after {self.tool_timeout}s")
-                    raise ToolExecutionError(f"Sync tool '{tool_name}' (in thread) execution timed out") from e
+                    logger.error(f"Sync tool '{tool_name}' execution (in thread pool) timed out after {self.tool_timeout}s")
+                    raise ToolExecutionError(f"Sync tool '{tool_name}' (in thread pool) execution timed out") from e
         except Exception as e:
             logger.error(f"Tool '{tool_name}' execution failed in async context: {e}")
             raise ToolExecutionError(f"Tool '{tool_name}' execution failed in async context: {e}") from e
@@ -1245,26 +1284,62 @@ class Agent(Generic[_ExpectedContentType]):
         if tool_calls:
             if self.concurrent_tool_execution and len(tool_calls) > 1:
                 # Use asyncio.gather for concurrent execution of async tool calls
-                results = await asyncio.gather(
-                    *(self._execute_single_tool_call_async(tc) for tc in tool_calls),
-                    return_exceptions=True  # Allow individual tasks to fail without stopping others
-                )
-                for i, result in enumerate(results):
-                    if isinstance(result, Exception):
-                        failed_tc = tool_calls[i]
-                        logger.error(f"Async tool call {failed_tc.function.name} (ID: {failed_tc.id}) failed: {result}")
-                        tool_call_outputs.append({
-                            "tool_call_id": failed_tc.id,
-                            "role": "tool",
-                            "name": failed_tc.function.name,
-                            "content": json.dumps({
-                                "error": str(result),
-                                "message": "Failed to retrieve tool result from concurrent async execution",
-                            }),
-                        })
+                # The individual tool calls will use the thread pool manager for sync tools
+                try:
+                    # Apply concurrency limits if specified
+                    if self.max_concurrent_tools and len(tool_calls) > self.max_concurrent_tools:
+                        # Process in batches to respect concurrency limits
+                        batches = [
+                            tool_calls[i:i + self.max_concurrent_tools]
+                            for i in range(0, len(tool_calls), self.max_concurrent_tools)
+                        ]
+                        
+                        for batch in batches:
+                            batch_results = await asyncio.gather(
+                                *(self._execute_single_tool_call_async(tc) for tc in batch),
+                                return_exceptions=True
+                            )
+                            for i, result in enumerate(batch_results):
+                                if isinstance(result, Exception):
+                                    failed_tc = batch[i]
+                                    logger.error(f"Async tool call {failed_tc.function.name} (ID: {failed_tc.id}) failed: {result}")
+                                    tool_call_outputs.append({
+                                        "tool_call_id": failed_tc.id,
+                                        "role": "tool",
+                                        "name": failed_tc.function.name,
+                                        "content": json.dumps({
+                                            "error": str(result),
+                                            "message": "Failed to retrieve tool result from concurrent async execution",
+                                        }),
+                                    })
+                                else:
+                                    tool_call_outputs.append(cast(Dict[str, Any], result))
                     else:
-                        # Type checker knows result is Dict[str, Any] here due to the isinstance check
-                        tool_call_outputs.append(cast(Dict[str, Any], result))
+                        # Execute all at once if within limits
+                        results = await asyncio.gather(
+                            *(self._execute_single_tool_call_async(tc) for tc in tool_calls),
+                            return_exceptions=True
+                        )
+                        for i, result in enumerate(results):
+                            if isinstance(result, Exception):
+                                failed_tc = tool_calls[i]
+                                logger.error(f"Async tool call {failed_tc.function.name} (ID: {failed_tc.id}) failed: {result}")
+                                tool_call_outputs.append({
+                                    "tool_call_id": failed_tc.id,
+                                    "role": "tool",
+                                    "name": failed_tc.function.name,
+                                    "content": json.dumps({
+                                        "error": str(result),
+                                        "message": "Failed to retrieve tool result from concurrent async execution",
+                                    }),
+                                })
+                            else:
+                                tool_call_outputs.append(cast(Dict[str, Any], result))
+                except Exception as e:
+                    logger.error(f"Error in async concurrent tool execution: {e}")
+                    # Fallback to sequential execution
+                    for tc in tool_calls:
+                        tool_call_outputs.append(await self._execute_single_tool_call_async(tc))
             else:
                 # Execute sequentially if concurrent_tool_execution is False or only one tool call
                 for tc in tool_calls:
@@ -1285,8 +1360,8 @@ class Agent(Generic[_ExpectedContentType]):
             raise AgentError(f"Failed to add messages to conversation in async handler: {e}") from e
 
         if conversation_id and self.memory:
-            # Assuming _save_messages_to_memory is thread-safe or can be called from async context
-            self._save_messages_to_memory(messages, conversation_id)
+            # Use async memory operations
+            await self._asave_messages_to_memory(messages, conversation_id)
 
     async def _run_loop_async(self, messages: List[Dict[str, Any]], conversation_id: Optional[str] = None) -> ThinagentResponse[_ExpectedContentType]:
         """Shared asynchronous step loop."""
@@ -1348,7 +1423,7 @@ class Agent(Generic[_ExpectedContentType]):
         self._tool_artifacts = {}
         # Ensure MCP tools are loaded before proceeding
         await self._ensure_mcp_tools_loaded()
-        messages = self._build_messages_with_memory(input, conversation_id, prompt_vars=prompt_vars)
+        messages = await self._abuild_messages_with_memory(input, conversation_id, prompt_vars=prompt_vars)
         return await self._run_loop_async(messages, conversation_id)
 
     async def _run_stream_async(
@@ -1362,7 +1437,7 @@ class Agent(Generic[_ExpectedContentType]):
 
         # Ensure MCP tools are loaded before proceeding
         await self._ensure_mcp_tools_loaded()
-        messages = self._prepare_stream(input, conversation_id, prompt_vars=prompt_vars)
+        messages = await self._aprepare_stream(input, conversation_id, prompt_vars=prompt_vars)
         accumulated_content = ""  # Track accumulated content for memory
 
         step_count = 0
@@ -1482,7 +1557,7 @@ class Agent(Generic[_ExpectedContentType]):
                         if conversation_id and self.memory and accumulated_content:
                             final_assistant_message = {"role": "assistant", "content": accumulated_content}
                             messages.append(final_assistant_message)
-                            self._save_messages_to_memory(messages, conversation_id)
+                            await self._asave_messages_to_memory(messages, conversation_id)
                             logger.info(f"Saved final streaming response to memory for conversation '{conversation_id}'")
                             
                         logger.info(f"Agent '{self.name}' async streaming completed successfully")
@@ -1725,6 +1800,54 @@ class Agent(Generic[_ExpectedContentType]):
         
         return messages
 
+    async def _abuild_messages_with_memory(self, input: str, conversation_id: Optional[str] = None, prompt_vars: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """
+        Async version of _build_messages_with_memory.
+        
+        Args:
+            input: Current user input
+            conversation_id: Optional conversation ID for memory retrieval
+            prompt_vars: Optional dictionary of variables to substitute into the prompt template.
+            
+        Returns:
+            List of messages including system prompt, history, and current input
+        """
+        messages: List[Dict[str, Any]] = []
+        
+        # Add system prompt
+        system_prompt = self._build_system_prompt(prompt_vars=prompt_vars)
+        messages.append({"role": "system", "content": system_prompt})
+        
+        # Add conversation history from memory if available
+        if self.memory and conversation_id:
+            try:
+                history = await self.memory.aget_messages(conversation_id)
+                # Filter out system messages from history to avoid duplication
+                # Also remove artifacts from tool messages since LLM doesn't need them
+                filtered_history = []
+                for msg in history:
+                    if msg.get("role") == "system":
+                        continue  # Skip system messages
+                    
+                    # Create a copy of the message for LLM
+                    llm_message = msg.copy()
+                    
+                    # Remove artifacts from tool messages - LLM doesn't need them
+                    if msg.get("role") == "tool" and "artifact" in llm_message:
+                        del llm_message["artifact"]
+                    
+                    filtered_history.append(llm_message)
+                
+                messages.extend(filtered_history)
+                logger.debug(f"Added {len(filtered_history)} messages from memory for conversation '{conversation_id}' (artifacts filtered out) (async)")
+            except Exception as e:
+                logger.warning(f"Failed to retrieve memory for conversation '{conversation_id}': {e}")
+        
+        # Add current user input
+        messages.append({"role": "user", "content": input})
+        
+        return messages
+
     def _save_messages_to_memory(self, messages: List[Dict], conversation_id: str) -> None:
         """
         Save new messages to memory, excluding system messages and existing history.
@@ -1753,6 +1876,39 @@ class Agent(Generic[_ExpectedContentType]):
         except Exception as e:
             logger.warning(f"Failed to save messages to memory for conversation '{conversation_id}': {e}")
 
+    async def _asave_messages_to_memory(self, messages: List[Dict], conversation_id: str) -> None:
+        """
+        Async version of _save_messages_to_memory.
+        
+        Args:
+            messages: List of all messages from the conversation
+            conversation_id: Conversation ID for memory storage
+        """
+        if not self.memory:
+            return
+            
+        try:
+            # Get existing message count to determine which messages are new
+            existing_count = await self.memory.aget_conversation_length(conversation_id)
+            
+            # Filter out system messages and get only new messages
+            non_system_messages = [msg for msg in messages if msg.get("role") != "system"]
+            new_messages = non_system_messages[existing_count:]
+            
+            # Save new messages to memory using batch operation if available
+            if hasattr(self.memory, 'aadd_messages') and new_messages:
+                await self.memory.aadd_messages(conversation_id, new_messages)
+                logger.debug(f"Saved {len(new_messages)} new messages to memory for conversation '{conversation_id}' (async batch)")
+            else:
+                # Fallback to individual message saves
+                for message in new_messages:
+                    await self.memory.aadd_message(conversation_id, message)
+                    
+                if new_messages:
+                    logger.debug(f"Saved {len(new_messages)} new messages to memory for conversation '{conversation_id}' (async)")
+        except Exception as e:
+            logger.warning(f"Failed to save messages to memory for conversation '{conversation_id}': {e}")
+
     def clear_memory(self, conversation_id: str) -> None:
         """
         Clear memory for a specific conversation.
@@ -1768,6 +1924,22 @@ class Agent(Generic[_ExpectedContentType]):
         
         self.memory.clear_conversation(conversation_id)
         logger.info(f"Cleared memory for conversation '{conversation_id}'")
+
+    async def aclear_memory(self, conversation_id: str) -> None:
+        """
+        Async version of clear_memory.
+        
+        Args:
+            conversation_id: Conversation ID to clear
+            
+        Raises:
+            ValueError: If no memory backend is configured
+        """
+        if not self.memory:
+            raise ValueError("No memory backend configured for this agent")
+        
+        await self.memory.aclear_conversation(conversation_id)
+        logger.info(f"Cleared memory for conversation '{conversation_id}' (async)")
 
     def get_conversation_history(self, conversation_id: str) -> List[Dict[str, Any]]:
         """
@@ -1787,6 +1959,24 @@ class Agent(Generic[_ExpectedContentType]):
         
         return self.memory.get_messages(conversation_id)
 
+    async def aget_conversation_history(self, conversation_id: str) -> List[Dict[str, Any]]:
+        """
+        Async version of get_conversation_history.
+        
+        Args:
+            conversation_id: Conversation ID to retrieve
+            
+        Returns:
+            List of message dictionaries
+            
+        Raises:
+            ValueError: If no memory backend is configured
+        """
+        if not self.memory:
+            raise ValueError("No memory backend configured for this agent")
+        
+        return await self.memory.aget_messages(conversation_id)
+
     def list_conversations(self) -> List[ConversationInfo]:
         """
         List all conversations with detailed metadata.
@@ -1802,6 +1992,21 @@ class Agent(Generic[_ExpectedContentType]):
         
         return self.memory.list_conversations()
 
+    async def alist_conversations(self) -> List[ConversationInfo]:
+        """
+        Async version of list_conversations.
+        
+        Returns:
+            List of conversation info dictionaries with metadata
+            
+        Raises:
+            ValueError: If no memory backend is configured
+        """
+        if not self.memory:
+            raise ValueError("No memory backend configured for this agent")
+        
+        return await self.memory.alist_conversations()
+
     def list_conversation_ids(self) -> List[str]:
         """
         List all conversation IDs in memory.
@@ -1816,6 +2021,21 @@ class Agent(Generic[_ExpectedContentType]):
             raise ValueError("No memory backend configured for this agent")
         
         return self.memory.list_conversation_ids()
+
+    async def alist_conversation_ids(self) -> List[str]:
+        """
+        Async version of list_conversation_ids.
+        
+        Returns:
+            List of conversation IDs as strings
+            
+        Raises:
+            ValueError: If no memory backend is configured
+        """
+        if not self.memory:
+            raise ValueError("No memory backend configured for this agent")
+        
+        return await self.memory.alist_conversation_ids()
 
     def get_conversation_info(self, conversation_id: str) -> Optional[ConversationInfo]:
         """
@@ -1834,3 +2054,21 @@ class Agent(Generic[_ExpectedContentType]):
             raise ValueError("No memory backend configured for this agent")
         
         return self.memory.get_conversation_info(conversation_id)
+
+    async def aget_conversation_info(self, conversation_id: str) -> Optional[ConversationInfo]:
+        """
+        Async version of get_conversation_info.
+        
+        Args:
+            conversation_id: Conversation ID to retrieve info for
+            
+        Returns:
+            ConversationInfo dictionary or None if conversation doesn't exist
+            
+        Raises:
+            ValueError: If no memory backend is configured
+        """
+        if not self.memory:
+            raise ValueError("No memory backend configured for this agent")
+        
+        return await self.memory.aget_conversation_info(conversation_id)
