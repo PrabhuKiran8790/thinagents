@@ -3,7 +3,7 @@ name = "thinagents"
 description = "A lightweight AI Agent framework"
 authors = [{ name = "Prabhu Kiran Konda" }]
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 keywords = ["AI", "LLM", "Agentic AI", "AI Agents"]
 classifiers = [
@@ -13,6 +13,25 @@ classifiers = [
 ]
 dependencies = ["litellm>=1.70.0", "graphviz>=0.20.0"]
 dynamic = ["version"]
+
+[project.optional-dependencies]
+async = ["aiofiles>=24.1.0", "aiosqlite>=0.20.0"]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "isort>=5.0.0",
+    "mypy>=1.0.0",
+]
+all = [
+    "aiofiles>=24.1.0",
+    "aiosqlite>=0.20.0",
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "isort>=5.0.0",
+    "mypy>=1.0.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/PrabhuKiran8790/thinagents"

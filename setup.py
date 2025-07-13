@@ -10,7 +10,7 @@ setup(
     url="https://github.com/PrabhuKiran8790/thinagents",
     license="MIT",
     packages=find_packages(exclude=["tests", "tests.*"]),
-    python_requires=">=3.11",
+    python_requires=">=3.10",
     install_requires=[
         "litellm>=1.70.0",
         "graphviz>=0.20.0"
