@@ -5,7 +5,7 @@ Toolkit module for ThinAgents providing organized tool collections.
 import inspect
 import logging
 from typing import Any, Callable, Dict, List, Optional, Set, Union
-from thinagents.tools.tool import ThinAgentsTool, tool as tool_decorator
+from thinagents.tools.tool import ThinAgentsTool, tool as tool_decorator, sanitize_function_name, FunctionNameSanitizationError
 
 logger = logging.getLogger(__name__)
 
@@ -130,11 +130,20 @@ class Toolkit:
                 tool_instance = method
                 if self._tool_prefix:
                     original_name = tool_instance.__name__
-                    tool_instance.__name__ = f"{self._tool_prefix}_{original_name}"
+                    try:
+                        tool_instance.__name__ = sanitize_function_name(f"{self._tool_prefix}_{original_name}")
+                    except FunctionNameSanitizationError as e:
+                        logger.error(f"Failed to sanitize tool name '{self._tool_prefix}_{original_name}': {e}")
+                        raise ValueError(f"Cannot create valid tool name for method '{original_name}' with prefix '{self._tool_prefix}': {e}") from e
                 tools.append(tool_instance)
             else:
                 # Convert regular method to tool
-                tool_name = f"{self._tool_prefix}_{name}" if self._tool_prefix else name
+                raw_tool_name = f"{self._tool_prefix}_{name}" if self._tool_prefix else name
+                try:
+                    tool_name = sanitize_function_name(raw_tool_name)
+                except FunctionNameSanitizationError as e:
+                    logger.error(f"Failed to sanitize tool name '{raw_tool_name}': {e}")
+                    raise ValueError(f"Cannot create valid tool name for method '{name}': {e}") from e
                 
                 # Create a wrapper that binds the method to self
                 def create_tool_wrapper(method_ref, tool_name):

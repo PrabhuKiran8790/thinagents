@@ -1,6 +1,7 @@
 import contextlib
 import functools
 import hashlib
+import re
 from typing import (
     Any,
     Callable,
@@ -38,6 +39,86 @@ logger = logging.getLogger(__name__)
 
 P = ParamSpec("P")
 R = TypeVar("R", covariant=True)
+
+
+class FunctionNameSanitizationError(Exception):
+    """Raised when function name sanitization fails."""
+    pass
+
+
+def sanitize_function_name(name: str) -> str:
+    """
+    Sanitize function name to meet LLM provider requirements.
+    
+    This function ensures compatibility across different LLM providers by applying
+    common function naming conventions:
+    - Must start with a letter or underscore
+    - Must be alphanumeric (a-z, A-Z, 0-9) or underscores (_) only
+    - Maximum length of 64 characters (strictest common requirement)
+    - No special characters or spaces
+    
+    Args:
+        name: Original function name
+        
+    Returns:
+        Sanitized function name that works across all LLM providers
+        
+    Raises:
+        FunctionNameSanitizationError: If the name cannot be sanitized to a valid function name
+    """
+    if not name or not isinstance(name, str):
+        raise FunctionNameSanitizationError(
+            f"Function name must be a non-empty string, got: {type(name).__name__} = {repr(name)}"
+        )
+    
+    original_name = name
+    
+    # Replace invalid characters with underscores (be more conservative)
+    # Only allow alphanumeric and underscores for maximum compatibility
+    sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', name)
+    
+    # Remove consecutive underscores
+    sanitized = re.sub(r'_+', '_', sanitized)
+    
+    # Ensure it starts with a letter or underscore
+    if not re.match(r'^[a-zA-Z_]', sanitized):
+        sanitized = f"tool_{sanitized}"
+    
+    # Truncate to 64 characters (common limit across providers)
+    if len(sanitized) > 64:
+        sanitized = sanitized[:64]
+    
+    # Remove trailing underscores and ensure it's not empty
+    sanitized = sanitized.rstrip('_')
+    
+    # Fallback if empty after sanitization
+    if not sanitized:
+        sanitized = "tool_function"
+    
+    # Ensure it doesn't conflict with reserved keywords
+    if sanitized.lower() in ('function', 'tool', 'call', 'run', 'execute'):
+        sanitized = f"{sanitized}_fn"
+        # Re-check length after adding suffix
+        if len(sanitized) > 64:
+            sanitized = sanitized[:64].rstrip('_')
+    
+    # Final validation - ensure the result is valid
+    if not sanitized:
+        raise FunctionNameSanitizationError(
+            f"Failed to sanitize function name '{original_name}' - resulted in empty string"
+        )
+    
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', sanitized):
+        raise FunctionNameSanitizationError(
+            f"Failed to sanitize function name '{original_name}' - result '{sanitized}' is not a valid function name"
+        )
+    
+    if len(sanitized) > 64:
+        raise FunctionNameSanitizationError(
+            f"Failed to sanitize function name '{original_name}' - result '{sanitized}' exceeds 64 character limit"
+        )
+    
+    return sanitized
 
 JSONSchemaType = Dict[str, Any]
 
@@ -424,7 +505,12 @@ def tool(
         actual_func = unwrapped_func
         annotated_desc = next((m for m in meta if isinstance(m, str)), "")
 
-    tool_name = name if name is not None else actual_func.__name__
+    raw_name = name if name is not None else actual_func.__name__
+    try:
+        tool_name = sanitize_function_name(raw_name)
+    except FunctionNameSanitizationError as e:
+        raise ValueError(f"Cannot create tool from function '{actual_func.__name__}': {e}") from e
+    
     is_async_tool = inspect.iscoroutinefunction(actual_func)
 
     if return_type == "content_and_artifact":

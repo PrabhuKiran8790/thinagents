@@ -11,6 +11,8 @@ from thinagents.tools.tool import (
     is_required_parameter,
     IS_PYDANTIC_AVAILABLE,
     _BaseModel,
+    sanitize_function_name,
+    FunctionNameSanitizationError,
 )
 import asyncio
 
@@ -65,7 +67,11 @@ class LangchainTool:
         self.return_type = 'content'
 
         # Set name and description
-        self.__name__ = name or getattr(langchain_tool, "name", self.primary_func.__name__)
+        raw_name = name or getattr(langchain_tool, "name", self.primary_func.__name__)
+        try:
+            self.__name__ = sanitize_function_name(raw_name)
+        except FunctionNameSanitizationError as e:
+            raise LangchainIntegrationError(f"Failed to create valid tool name for LangChain tool: {e}") from e
         self.description = description or getattr(langchain_tool, "description", inspect.getdoc(self.primary_func) or "")
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
