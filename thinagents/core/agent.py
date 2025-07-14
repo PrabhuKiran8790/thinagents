@@ -270,6 +270,10 @@ class Agent(Generic[_ExpectedContentType]):
             ]
             combined_tools = (self._provided_tools or []) + sub_agent_tools
             self.tool_schemas, self.tool_maps = generate_tool_schemas(combined_tools)
+            
+            # Collect toolkit contexts
+            self._toolkit_contexts = self._collect_toolkit_contexts()
+            
             logger.info(f"Initialized {len(self.tool_maps)} tools for agent '{self.name}'")
         except Exception as e:
             logger.error(f"Failed to initialize tools for agent '{self.name}': {e}")
@@ -360,6 +364,22 @@ class Agent(Generic[_ExpectedContentType]):
 
         return tool_decorator(_delegate_to_sub_agent)
 
+    def _collect_toolkit_contexts(self) -> List[str]:
+        """Collect contexts from all toolkits in the tools list."""
+        contexts = []
+        
+        for tool in self._provided_tools or []:
+            if isinstance(tool, Toolkit):
+                try:
+                    context = tool.get_toolkit_context()
+                    if context:
+                        contexts.append(context.strip())
+                        logger.debug(f"Collected context from {tool.__class__.__name__}")
+                except Exception as e:
+                    logger.error(f"Failed to get context from {tool.__class__.__name__}: {e}")
+        
+        return contexts
+
     def _execute_tool(self, tool_name: str, tool_args: dict) -> Any:
         """
         Executes a tool by name with the provided arguments.
@@ -428,7 +448,13 @@ class Agent(Generic[_ExpectedContentType]):
                         f"Instructions for sub-agent {sa.name}", sa.instructions
                 )
         
-        return prompt_config.build(**(prompt_vars or {}))
+        base_prompt = prompt_config.build(**(prompt_vars or {}))
+        
+        # Add toolkit contexts if any
+        if hasattr(self, '_toolkit_contexts') and self._toolkit_contexts:
+            base_prompt += "\n\n" + "\n\n".join(self._toolkit_contexts)
+        self._built_system_prompt = base_prompt
+        return base_prompt
 
     def _extract_usage_metrics(self, response: Any) -> Optional[UsageMetrics]:
         """Extract usage metrics from LLM response."""
@@ -832,15 +858,15 @@ class Agent(Generic[_ExpectedContentType]):
             if self.concurrent_tool_execution and len(tool_calls) > 1:
                 # Use thread pool manager for concurrent execution
                 tool_call_funcs = [(self._execute_single_tool_call, {"tc": tc}) for tc in tool_calls]
-                
+
                 try:
                     # Execute all tool calls concurrently
                     results = self._thread_pool_manager.execute_tools_concurrently(
-                        [(func, args) for func, args in tool_call_funcs],
+                        list(tool_call_funcs),
                         timeout=self.tool_timeout,
-                        max_concurrent=self.max_concurrent_tools
+                        max_concurrent=self.max_concurrent_tools,
                     )
-                    
+
                     # Process results
                     for i, result in enumerate(results):
                         if isinstance(result, Exception):
