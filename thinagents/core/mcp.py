@@ -57,7 +57,7 @@ class MCPServerConfig(TypedDict, total=False):
     Required keys by transport:
       • stdio:              command, args
       • sse/http variants:  url
-    Optional keys: transport (defaults to "stdio"), name, headers.
+    Optional keys: transport (defaults to "stdio"), name, headers, env.
     """
 
     # Publicly support only stdio and http (Streamable HTTP per spec)
@@ -69,6 +69,10 @@ class MCPServerConfig(TypedDict, total=False):
 
     url: str
     headers: Dict[str, str]
+    # Optional environment variables. For stdio transports, these are
+    # applied to the spawned process (when supported). For HTTP transports,
+    # they are forwarded as headers with the prefix "x-env-".
+    env: Dict[str, str]
 
 
 class MCPServerConfigWithId(TypedDict, total=False):
@@ -81,6 +85,7 @@ class MCPServerConfigWithId(TypedDict, total=False):
     args: List[str]  # stdio-specific
     url: str  # http endpoint
     headers: Dict[str, str]
+    env: Dict[str, str]
 
 
 class MCPConnectionInfo(TypedDict):
@@ -171,10 +176,20 @@ class MCPManager:
             if transport == "stdio":
                 command_val = cast(str, s_cfg["command"])  # type: ignore[index]
                 args_val = cast(List[str], s_cfg["args"])  # type: ignore[index]
-                server_params_local = StdioServerParameters(
-                    command=command_val,
-                    args=args_val,
-                )
+                # Best-effort support for passing env to the stdio server. Not all
+                # StdioServerParameters implementations support an 'env' kwarg; fall back gracefully.
+                try:
+                    server_params_local = StdioServerParameters(
+                        command=command_val,
+                        args=args_val,
+                        env=s_cfg.get("env"),  # type: ignore[arg-type]
+                    )
+                except TypeError:
+                    logger.debug("StdioServerParameters does not accept 'env'; starting without custom env")
+                    server_params_local = StdioServerParameters(
+                        command=command_val,
+                        args=args_val,
+                    )
                 return stdio_client(server_params_local)
             elif transport == "http":
                 if streamablehttp_client is not None:
@@ -231,6 +246,7 @@ class MCPManager:
                                                         read_inner, write_inner = conn_tuple_inner  # type: ignore[misc]
                                                     async with ClientSession(read_inner, write_inner) as session_inner:
                                                         await session_inner.initialize()
+
 
                                                         tool_call_dict = {
                                                             "id": f"call_{_orig_name}_{secrets.token_hex(4)}",
@@ -337,6 +353,10 @@ def normalize_mcp_servers(servers: Optional[List[MCPServerConfig]]) -> List[MCPS
                 "args": args,
             }
 
+            env_vars = server.get("env")
+            if env_vars is not None:
+                normalized_server["env"] = env_vars  # type: ignore[index]
+
         elif transport in ("http", "streamable-http", "sse"):
             url = server.get("url")
             if url is None:
@@ -355,8 +375,18 @@ def normalize_mcp_servers(servers: Optional[List[MCPServerConfig]]) -> List[MCPS
             }
 
             # Optional headers
-            headers = server.get("headers")
-            if headers is not None:
+            headers = dict(server.get("headers", {}))
+
+            # Optional env passed via headers with prefix for HTTP transports
+            env_vars_http = server.get("env")
+            if env_vars_http is not None:
+                for k, v in env_vars_http.items():
+                    header_key = f"x-env-{k}"
+                    # Do not overwrite if user explicitly set the header
+                    headers.setdefault(header_key, v)
+                normalized_server["env"] = env_vars_http  # type: ignore[index]
+
+            if headers:
                 normalized_server["headers"] = headers  # type: ignore[index]
 
         else:
