@@ -60,8 +60,8 @@ class MCPServerConfig(TypedDict, total=False):
     Optional keys: transport (defaults to "stdio"), name, headers, env.
     """
 
-    # Publicly support only stdio and http (Streamable HTTP per spec)
-    transport: Literal["stdio", "http"]
+    # Publicly support stdio, http (Streamable HTTP per spec), and legacy sse
+    transport: Literal["stdio", "http", "sse"]
     name: str
 
     command: str
@@ -78,8 +78,8 @@ class MCPServerConfig(TypedDict, total=False):
 class MCPServerConfigWithId(TypedDict, total=False):
     """Internal MCP server configuration with required ID."""
     id: str
-    # Internally we store only stdio or http; legacy inputs are coerced to http
-    transport: Literal["stdio", "http"]
+    # Internally we store stdio, http, or sse
+    transport: Literal["stdio", "http", "sse"]
     name: str
     command: str
     args: List[str]  # stdio-specific
@@ -194,10 +194,14 @@ class MCPManager:
             elif transport == "http":
                 if streamablehttp_client is not None:
                     return streamablehttp_client(s_cfg["url"], headers=s_cfg.get("headers"))  # type: ignore[arg-type]
-                # Fallback for older servers/clients that still expose SSE endpoint
+                # Best-effort fallback for very old servers – try SSE only if HTTP client is unavailable
                 if sse_client is not None:
                     return sse_client(s_cfg["url"], headers=s_cfg.get("headers"))  # type: ignore[arg-type]
-                raise ValueError("HTTP transport requested but no compatible client is available.")
+                raise ValueError("HTTP transport requested but no compatible HTTP client is available.")
+            elif transport == "sse":
+                if sse_client is not None:
+                    return sse_client(s_cfg["url"], headers=s_cfg.get("headers"))  # type: ignore[arg-type]
+                raise ValueError("SSE transport requested but SSE client is not available.")
             raise ValueError(f"Unknown MCP transport '{transport}'.")
 
         for server_config in self._servers:
@@ -362,17 +366,30 @@ def normalize_mcp_servers(servers: Optional[List[MCPServerConfig]]) -> List[MCPS
             if url is None:
                 raise ValueError(f"{transport} MCP server config must include 'url'.")
 
-            if transport in ("streamable-http", "sse"):
+            if transport == "streamable-http":
                 logger.warning(
-                    f"Transport '{transport}' is deprecated or legacy; coercing to 'http' per MCP spec."
+                    "Transport 'streamable-http' is deprecated; coercing to 'http'."
                 )
-
-            normalized_server = {
-                "id": server_id,
-                "transport": cast(Literal["http"], "http"),
-                "name": server.get("name", ""),
-                "url": url,
-            }
+                normalized_server = {
+                    "id": server_id,
+                    "transport": cast(Literal["http"], "http"),
+                    "name": server.get("name", ""),
+                    "url": url,
+                }
+            elif transport == "http":
+                normalized_server = {
+                    "id": server_id,
+                    "transport": cast(Literal["http"], "http"),
+                    "name": server.get("name", ""),
+                    "url": url,
+                }
+            else:  # transport == "sse"
+                normalized_server = {
+                    "id": server_id,
+                    "transport": cast(Literal["sse"], "sse"),
+                    "name": server.get("name", ""),
+                    "url": url,
+                }
 
             # Optional headers
             headers = dict(server.get("headers", {}))
