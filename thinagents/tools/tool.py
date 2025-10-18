@@ -1,6 +1,5 @@
 import contextlib
 import functools
-import hashlib
 import re
 from typing import (
     Any,
@@ -13,13 +12,10 @@ from typing import (
     Annotated,
     Protocol,
     Literal,
-    Final,
-    ClassVar,
-    TypeVar,
     List,
     Tuple,
     Set,
-    FrozenSet,
+    TypeVar,
     ParamSpec,
     runtime_checkable,
 )
@@ -72,37 +68,17 @@ def sanitize_function_name(name: str) -> str:
         )
     
     original_name = name
-    
-    # Replace invalid characters with underscores (be more conservative)
-    # Only allow alphanumeric and underscores for maximum compatibility
     sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', name)
-    
-    # Remove consecutive underscores
     sanitized = re.sub(r'_+', '_', sanitized)
-    
-    # Ensure it starts with a letter or underscore
+
     if not re.match(r'^[a-zA-Z_]', sanitized):
         sanitized = f"tool_{sanitized}"
     
-    # Truncate to 64 characters (common limit across providers)
     if len(sanitized) > 64:
         sanitized = sanitized[:64]
     
-    # Remove trailing underscores and ensure it's not empty
-    sanitized = sanitized.rstrip('_')
+    sanitized = sanitized.rstrip('_') or "tool_function"
     
-    # Fallback if empty after sanitization
-    if not sanitized:
-        sanitized = "tool_function"
-    
-    # Ensure it doesn't conflict with reserved keywords
-    if sanitized.lower() in ('function', 'tool', 'call', 'run', 'execute'):
-        sanitized = f"{sanitized}_fn"
-        # Re-check length after adding suffix
-        if len(sanitized) > 64:
-            sanitized = sanitized[:64].rstrip('_')
-    
-    # Final validation - ensure the result is valid
     if not sanitized:
         raise FunctionNameSanitizationError(
             f"Failed to sanitize function name '{original_name}' - resulted in empty string"
@@ -140,35 +116,6 @@ with contextlib.suppress(ImportError):
     if _PYDANTIC_V1 or _PYDANTIC_V2:
         IS_PYDANTIC_AVAILABLE = True
 
-# Schema caching for better performance
-_SCHEMA_CACHE: Dict[str, JSONSchemaType] = {}
-_SCHEMA_CACHE_ENABLED = True
-
-
-def enable_schema_cache(enabled: bool = True) -> None:
-    """Enable or disable schema caching globally."""
-    global _SCHEMA_CACHE_ENABLED
-    _SCHEMA_CACHE_ENABLED = enabled
-    if not enabled:
-        clear_schema_cache()
-
-
-def clear_schema_cache() -> None:
-    """Clear the schema cache."""
-    global _SCHEMA_CACHE
-    _SCHEMA_CACHE.clear()
-    logger.debug("Schema cache cleared")
-
-
-def _get_cache_key(py_type: Any, schema_source: str = "") -> str:
-    """Generate a cache key for a Python type and schema source."""
-    type_str = str(py_type)
-    if hasattr(py_type, "__module__"):
-        type_str = f"{py_type.__module__}.{type_str}"
-    
-    cache_key = f"{type_str}_{schema_source}"
-    return hashlib.md5(cache_key.encode()).hexdigest()
-
 
 @runtime_checkable
 class ThinAgentsTool(Protocol[P, R]):
@@ -193,25 +140,15 @@ def _handle_enum(py_type: Any) -> JSONSchemaType:
     Convert a Python Enum type to a JSON schema representation.
     Handles string, integer, and number enums.
     """
-    # Check cache first
-    cache_key = _get_cache_key(py_type, "enum")
-    if _SCHEMA_CACHE_ENABLED and cache_key in _SCHEMA_CACHE:
-        return _SCHEMA_CACHE[cache_key]
-    
     values = [e.value for e in py_type]
     if all(isinstance(v, str) for v in values):
-        schema = {"type": "string", "enum": values}
+        return {"type": "string", "enum": values}
     elif all(isinstance(v, int) for v in values):
-        schema = {"type": "integer", "enum": values}
+        return {"type": "integer", "enum": values}
     elif all(isinstance(v, (int, float)) for v in values):
-        schema = {"type": "number", "enum": values}
+        return {"type": "number", "enum": values}
     else:
-        schema = {"enum": values}
-    
-    if _SCHEMA_CACHE_ENABLED:
-        _SCHEMA_CACHE[cache_key] = schema
-    
-    return schema
+        return {"enum": values}
 
 def _handle_sequence(py_type: Any, args: tuple) -> JSONSchemaType:
     """
@@ -222,19 +159,13 @@ def _handle_sequence(py_type: Any, args: tuple) -> JSONSchemaType:
 
 def _handle_tuple(args: tuple) -> JSONSchemaType:
     """
-    Convert a tuple type to a JSON schema representation.
-    Handles both fixed-length and variable-length tuples.
+    Convert a tuple type to a JSON schema array.
     """
     if not args:
         return {"type": "array"}
     if len(args) == 2 and args[1] is Ellipsis:
         return {"type": "array", "items": map_type_to_schema(args[0])}
-    return {
-        "type": "array",
-        "prefixItems": [map_type_to_schema(arg) for arg in args],
-        "minItems": len(args),
-        "maxItems": len(args),
-    }
+    return {"type": "array"}
 
 def _handle_dataclass(py_type: Any) -> JSONSchemaType:
     """
@@ -283,155 +214,66 @@ def _handle_union(args: tuple) -> JSONSchemaType:
         schemas.append({"type": "null"})
     return {"anyOf": schemas}
 
-@runtime_checkable
-class TypeHandler(Protocol):
-    """
-    Protocol for custom type handlers that convert Python types to JSON schema.
-    """
-    def can_handle(self, py_type: Any) -> bool: ...
-    def handle(self, py_type: Any, schema_mapper: Callable[[Any], JSONSchemaType]) -> JSONSchemaType: ...
-
-class BaseTypeHandler:
-    def can_handle(self, py_type: Any) -> bool:
-        return False
-
-    def handle(self, py_type: Any, schema_mapper: Callable[[Any], JSONSchemaType]) -> JSONSchemaType:
-        return {"type": "object"}
-
-class PrimitiveHandler(BaseTypeHandler):
-    """
-    Handles primitive Python types (str, int, float, bool, None) for JSON schema conversion.
-    """
-    def can_handle(self, py_type: Any) -> bool:
-        return py_type in _PRIMITIVE_TYPE_MAP
-
-    def handle(self, py_type: Any, _: Callable[[Any], JSONSchemaType]) -> JSONSchemaType:
-        return _PRIMITIVE_TYPE_MAP[py_type]
-
-class EnumHandler(BaseTypeHandler):
-    """
-    Handles Python Enum types for JSON schema conversion.
-    """
-    def can_handle(self, py_type: Any) -> bool:
-        return isinstance(py_type, type) and issubclass(py_type, enum.Enum)
-
-    def handle(self, py_type: Any, _: Callable[[Any], JSONSchemaType]) -> JSONSchemaType:
-        return _handle_enum(py_type)
-
-class PydanticHandler(BaseTypeHandler):
-    """
-    Handles Pydantic BaseModel types for JSON schema conversion, supporting both v1 and v2.
-    """
-    def can_handle(self, py_type: Any) -> bool:
-        return (IS_PYDANTIC_AVAILABLE and isinstance(py_type, type) 
-                and issubclass(py_type, _BaseModel))
-
-    def handle(self, py_type: Any, _: Callable[[Any], JSONSchemaType]) -> JSONSchemaType:
-        schema: Optional[JSONSchemaType] = None
-        try:
-            if _PYDANTIC_V2 and hasattr(py_type, "model_json_schema"):
-                schema = py_type.model_json_schema()  # type: ignore
-            elif _PYDANTIC_V1 and hasattr(py_type, "schema"):
-                schema = py_type.schema()  # type: ignore
-        except Exception as e:
-            logger.error(f"Error generating Pydantic schema for {py_type}: {e}", exc_info=True)
-            return {"type": "object", "description": f"Error generating Pydantic schema: {e}"}
-        return schema if schema is not None else {"type": "object"}
-
-class SequenceHandler(BaseTypeHandler):
-    """
-    Handles sequence types (lists, sequences) for JSON schema conversion.
-    """
-    def can_handle(self, py_type: Any) -> bool:
-        origin = get_origin(py_type)
-        return (origin in (list, List) or 
-                (isinstance(py_type, type) and issubclass(py_type, Sequence) 
-                 and not issubclass(py_type, (str, bytes, bytearray))))
-
-    def handle(self, py_type: Any, schema_mapper: Callable[[Any], JSONSchemaType]) -> JSONSchemaType:
-        return _handle_sequence(py_type, get_args(py_type))
-
-_type_handlers = [
-    PrimitiveHandler(),
-    EnumHandler(),
-    PydanticHandler(),
-    SequenceHandler(),
-]
 
 def map_type_to_schema(py_type: Any) -> JSONSchemaType:
     """
     Main entry point for mapping a Python type annotation to a JSON schema type.
-    Delegates to registered type handlers and handles common generic types.
-    Uses caching for improved performance.
     """
-    # Check cache first
-    cache_key = _get_cache_key(py_type, "main")
-    if _SCHEMA_CACHE_ENABLED and cache_key in _SCHEMA_CACHE:
-        return _SCHEMA_CACHE[cache_key]
+    if py_type in _PRIMITIVE_TYPE_MAP:
+        return _PRIMITIVE_TYPE_MAP[py_type]
+    
+    if py_type is Any:
+        return {}
+    
+    if isinstance(py_type, type) and issubclass(py_type, enum.Enum):
+        return _handle_enum(py_type)
+    
+    if IS_PYDANTIC_AVAILABLE and isinstance(py_type, type) and issubclass(py_type, _BaseModel):
+        try:
+            if _PYDANTIC_V2 and hasattr(py_type, "model_json_schema"):
+                return py_type.model_json_schema()  # type: ignore
+            elif _PYDANTIC_V1 and hasattr(py_type, "schema"):
+                return py_type.schema()  # type: ignore
+        except Exception as e:
+            logger.error(f"Error generating Pydantic schema for {py_type}: {e}", exc_info=True)
+            return {"type": "object"}
+        return {"type": "object"}
+    
+    if is_dataclass(py_type):
+        return _handle_dataclass(py_type)
     
     origin = get_origin(py_type)
     args = get_args(py_type)
-
-    schema = None
     
-    for handler in _type_handlers:
-        if handler.can_handle(py_type):
-            schema = handler.handle(py_type, map_type_to_schema)
-            break
-
-    if schema is None:
-        if origin is Literal:
-            schema = _handle_enum(lambda: args)
-        elif origin in (tuple, Tuple):
-            schema = _handle_tuple(args)
-        elif origin in (set, Set, frozenset, FrozenSet):
-            schema = {**_handle_sequence(py_type, args), "uniqueItems": True}
-        elif is_dataclass(py_type):
-            schema = _handle_dataclass(py_type)
-        elif origin in (dict, Dict) or (isinstance(py_type, type) and issubclass(py_type, Mapping)):
-            if not args or len(args) != 2:
-                schema = {"type": "object", "additionalProperties": map_type_to_schema(Any)}
-            else:
-                key_type, value_type = args
-                schema = {"type": "object", "additionalProperties": map_type_to_schema(value_type)}
-                if key_type is not str:
-                    schema["x-key-type"] = str(key_type)
-        elif origin is Union:
-            schema = _handle_union(args)
-        elif origin is Optional:
-            schema = _handle_union((args[0], type(None))) if args else {"type": "null"}
-        elif origin in (Final, ClassVar):
-            schema = map_type_to_schema(args[0]) if args else {}
-        elif py_type is Any:
-            logger.debug("Mapping 'Any' type to empty schema.")
-            schema = {}
-        elif isinstance(py_type, TypeVar):
-            if constraints := getattr(py_type, "__constraints__", None):
-                logger.debug(f"Mapping TypeVar {py_type} with constraints {constraints} to anyOf schema.")
-                schema = {"anyOf": [map_type_to_schema(c) for c in constraints]}
-            else:
-                bound = getattr(py_type, "__bound__", None)
-                if bound and bound is not object and bound is not py_type:
-                    logger.debug(f"Mapping TypeVar {py_type} with bound {bound} to schema of bound type.")
-                    schema = map_type_to_schema(bound)
-                else:
-                    logger.debug(f"Mapping TypeVar {py_type} (unconstrained or self-bound) to empty schema.")
-                    schema = {}
-        else:
-            logger.warning(f"No specific schema handler for type {py_type}. Defaulting to 'object'.")
-            schema = {"type": "object"}
+    if origin in (list, List):
+        return _handle_sequence(py_type, args)
     
-    # Cache the result
-    if _SCHEMA_CACHE_ENABLED and schema is not None:
-        _SCHEMA_CACHE[cache_key] = schema
+    if isinstance(py_type, type) and issubclass(py_type, Sequence) and not issubclass(py_type, (str, bytes, bytearray)):
+        return _handle_sequence(py_type, args)
     
-    return schema or {"type": "object"}
+    if origin in (tuple, Tuple):
+        return _handle_tuple(args)
+    
+    if origin in (set, Set):
+        return {"type": "array", "items": map_type_to_schema(args[0] if args else Any), "uniqueItems": True}
+    
+    if origin in (dict, Dict) or (isinstance(py_type, type) and issubclass(py_type, Mapping)):
+        if not args or len(args) != 2:
+            return {"type": "object"}
+        return {"type": "object", "additionalProperties": map_type_to_schema(args[1])}
+    
+    if origin is Union:
+        return _handle_union(args)
+    
+    if origin is Literal:
+        return _handle_enum(lambda: args)
+    
+    return {"type": "object"}
 
 
-@functools.lru_cache(maxsize=256)
 def generate_param_schema(param_name: str, param: inspect.Parameter, annotation: Any) -> JSONSchemaType:
     """
-    Generate JSON schema for a function parameter with caching.
+    Generate JSON schema for a function parameter.
     
     Args:
         param_name: Name of the parameter
@@ -443,13 +285,8 @@ def generate_param_schema(param_name: str, param: inspect.Parameter, annotation:
     """
     schema = map_type_to_schema(annotation)
     
-    # Add default value if present
     if param.default is not inspect.Parameter.empty and param.default is not None:
         schema["default"] = param.default
-    
-    # Add parameter description if available from docstring
-    if hasattr(param, "__doc__") and param.__doc__:
-        schema["description"] = param.__doc__
     
     return schema
 
@@ -543,24 +380,6 @@ def tool(
         if "title" in schema_dict:
             schema_dict = dict(schema_dict)
             schema_dict.pop("title")
-        sig = inspect.signature(actual_func)
-        func_param_names = list(sig.parameters.keys())
-        func_required = [
-            name for name, param in sig.parameters.items()
-            if is_required_parameter(param, param.annotation if param.annotation is not inspect.Parameter.empty else Any)
-        ]
-        schema_properties = list(schema_dict.get("properties", {}).keys())
-        schema_required = list(schema_dict.get("required", []))
-        # Check that all function parameters are in schema properties and vice versa
-        if set(func_param_names) != set(schema_properties):
-            raise ValueError(
-                f"pydantic_schema properties {schema_properties} do not match function parameters {func_param_names} for tool '{tool_name}'"
-            )
-        # Check that required match
-        if set(func_required) != set(schema_required):
-            raise ValueError(
-                f"pydantic_schema required {schema_required} do not match function required parameters {func_required} for tool '{tool_name}'"
-            )
 
     @functools.wraps(actual_func)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> Any:
@@ -598,20 +417,28 @@ def tool(
                 annotation = type_hints.get(name, param.annotation)
                 if annotation is inspect.Parameter.empty:
                     annotation = Any
-                param_def = generate_param_schema(name, param, annotation)
+                
+                param_def = map_type_to_schema(annotation)
+                
+                if param.default is not inspect.Parameter.empty and param.default is not None:
+                    param_def["default"] = param.default
+                
                 generated_params_schema["properties"][name] = param_def  # type: ignore
                 if is_required_parameter(param, annotation):
                     generated_params_schema["required"].append(name)
             generated_params_schema["required"] = sorted(list(set(generated_params_schema["required"])))
             params_schema = generated_params_schema
-        # wrap schema with return_type metadata
+        
+        function_schema = {
+            "name": tool_name,
+            "parameters": params_schema,
+        }
+        if description:
+            function_schema["description"] = description
+        
         original_schema = {
             "type": "function",
-            "function": {
-                "name": tool_name,
-                "description": description,
-                "parameters": params_schema,
-            },
+            "function": function_schema,
         }
         return {"tool_schema": original_schema, "return_type": return_type}
 

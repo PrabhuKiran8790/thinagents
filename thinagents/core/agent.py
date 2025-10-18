@@ -59,7 +59,7 @@ class AsyncToolInSyncContextError(AgentError):
 
 def generate_tool_schemas(
     tools: List[Union[ThinAgentsTool, Callable, Toolkit]],
-) -> Tuple[List[Dict], Dict[str, ThinAgentsTool]]:
+) -> Tuple[List[Dict], Dict[str, Callable]]:
     """
     Generate JSON schemas for provided tools and return tool schemas list and tool maps.
 
@@ -67,13 +67,13 @@ def generate_tool_schemas(
         tools: A list containing ThinAgentsTool instances, callables decorated with @tool, and/or Toolkit instances.
 
     Returns:
-        Tuple[List[Dict], Dict[str, ThinAgentsTool]]: A list of tool schema dictionaries and a mapping from tool names to ThinAgentsTool instances.
+        Tuple[List[Dict], Dict[str, Callable]]: A list of tool schema dictionaries and a mapping from tool names to callable tools.
         
     Raises:
         AgentError: If tool schema generation fails.
     """
     tool_schemas = []
-    tool_maps: Dict[str, ThinAgentsTool] = {}
+    tool_maps: Dict[str, Callable] = {}
 
     for tool in tools:
         try:
@@ -93,7 +93,7 @@ def generate_tool_schemas(
                         actual_schema = schema_data
                     
                     tool_schemas.append(actual_schema)
-            elif isinstance(tool, ThinAgentsTool):
+            elif isinstance(tool, ThinAgentsTool) or hasattr(tool, 'tool_schema'):
                 schema_data = tool.tool_schema()
                 tool_maps[tool.__name__] = tool
                 
@@ -165,6 +165,7 @@ class Agent(Generic[_ExpectedContentType]):
         tool_timeout: float = DEFAULT_TOOL_TIMEOUT,
         memory: Optional[BaseMemory] = None,
         mcp_servers: Optional[List[MCPServerConfig]] = None,
+        granular_stream: bool = True,
         **kwargs,
     ):
         """
@@ -248,7 +249,7 @@ class Agent(Generic[_ExpectedContentType]):
 
         self._provided_tools = tools or []
 
-        self.granular_stream = True
+        self.granular_stream = granular_stream
         """Whether to emit per-character ThinagentResponseStream chunks when streaming"""
 
         self._mcp_manager = MCPManager()
