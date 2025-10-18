@@ -18,6 +18,7 @@ from typing import (
     TypeVar,
     ParamSpec,
     runtime_checkable,
+    overload,
 )
 import logging
 
@@ -311,13 +312,31 @@ def is_required_parameter(param: inspect.Parameter, annotation: Any) -> bool:
     )
 
 
+@overload
+def tool(
+    fn_for_tool: Callable[P, R],
+    *,
+    return_type: Literal["content", "content_and_artifact"] = "content",
+    pydantic_schema: Optional[Any] = None,
+    name: Optional[str] = None,
+) -> ThinAgentsTool[P, R]: ...
+
+@overload
+def tool(
+    fn_for_tool: None = None,
+    *,
+    return_type: Literal["content", "content_and_artifact"] = "content",
+    pydantic_schema: Optional[Any] = None,
+    name: Optional[str] = None,
+) -> Callable[[Callable[P, R]], ThinAgentsTool[P, R]]: ...
+
 def tool(
     fn_for_tool: Optional[Callable[P, R]] = None,
     *,
     return_type: Literal["content", "content_and_artifact"] = "content",
     pydantic_schema: Optional[Any] = None,
     name: Optional[str] = None,
-) -> ThinAgentsTool[P, R]:  # type: ignore
+) -> Union[ThinAgentsTool[P, R], Callable[[Callable[P, R]], ThinAgentsTool[P, R]]]:
     """
     Decorator to register a function as a ThinAgentsTool, optionally specifying the return type and/or a pydantic schema.
     Enforces return type compatibility and attaches a tool_schema method for OpenAPI/JSON schema generation.
