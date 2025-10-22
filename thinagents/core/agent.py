@@ -433,7 +433,7 @@ class Agent(Generic[_ExpectedContentType]):
             prompt_config = self.prompt
         else:
             base_prompt = (
-                f"You are a helpful assistant. Your name is {self.name}. Answer the user's question to the best of your ability."
+                "You are a helpful assistant. Answer the user's question to the best of your ability."
                 if self.prompt is None
                 else self.prompt
             )
@@ -849,6 +849,7 @@ class Agent(Generic[_ExpectedContentType]):
             artifact=self._tool_artifacts,
             tool_name=None,
             tool_call_id=None,
+            tool_call_args=None,
         )
 
     def _handle_tool_calls(self, tool_calls: List[Any], message: Any, messages: List[Dict], conversation_id: Optional[str] = None) -> None:
@@ -976,6 +977,7 @@ class Agent(Generic[_ExpectedContentType]):
                             content_type="str",
                             tool_name=None,
                             tool_call_id=None,
+                            tool_call_args=None,
                             response_id=None,
                             created_timestamp=None,
                             model_used=None,
@@ -1036,6 +1038,7 @@ class Agent(Generic[_ExpectedContentType]):
                                     content_type="str",
                                     tool_name=None,
                                     tool_call_id=None,
+                                    tool_call_args=None,
                                     response_id=getattr(chunk, "id", None),
                                     created_timestamp=getattr(chunk, "created", None),
                                     model_used=getattr(chunk, "model", None),
@@ -1051,6 +1054,7 @@ class Agent(Generic[_ExpectedContentType]):
                             content_type="str",
                             tool_name=None,
                             tool_call_id=None,
+                            tool_call_args=None,
                             response_id=getattr(chunk, "id", None),
                             created_timestamp=getattr(chunk, "created", None),
                             model_used=getattr(chunk, "model", None),
@@ -1077,6 +1081,7 @@ class Agent(Generic[_ExpectedContentType]):
                             content_type="completion",
                             tool_name=None,
                             tool_call_id=None,
+                            tool_call_args=None,
                             response_id=getattr(chunk, "id", None),
                             created_timestamp=getattr(chunk, "created", None),
                             model_used=getattr(chunk, "model", None),
@@ -1095,6 +1100,7 @@ class Agent(Generic[_ExpectedContentType]):
                     content_type="error",
                     tool_name=None,
                     tool_call_id=None,
+                    tool_call_args=None,
                     response_id=None,
                     created_timestamp=None,
                     model_used=None,
@@ -1113,6 +1119,7 @@ class Agent(Generic[_ExpectedContentType]):
                         content_type="tool_call",
                         tool_name=call_name,
                         tool_call_id=call_id or f"call_{call_name}",
+                        tool_call_args=call_args or None,
                         response_id=None,
                         created_timestamp=None,
                         model_used=None,
@@ -1154,6 +1161,7 @@ class Agent(Generic[_ExpectedContentType]):
                         content_type="tool_result",
                         tool_name=call_name,
                         tool_call_id=call_id or f"call_{call_name}",
+                        tool_call_args=None,
                         response_id=None,
                         created_timestamp=None,
                         model_used=None,
@@ -1208,6 +1216,7 @@ class Agent(Generic[_ExpectedContentType]):
             content_type="error",
             tool_name=None,
             tool_call_id=None,
+            tool_call_args=None,
             response_id=None,
             created_timestamp=None,
             model_used=None,
@@ -1524,6 +1533,7 @@ class Agent(Generic[_ExpectedContentType]):
                             content_type="str",
                             tool_name=None,
                             tool_call_id=None,
+                            tool_call_args=None,
                             response_id=None,
                             created_timestamp=None,
                             model_used=None,
@@ -1580,6 +1590,7 @@ class Agent(Generic[_ExpectedContentType]):
                                     content_type="str",
                                     tool_name=None,
                                     tool_call_id=None,
+                                    tool_call_args=None,
                                     response_id=getattr(chunk, "id", None),
                                     created_timestamp=getattr(chunk, "created", None),
                                     model_used=getattr(chunk, "model", None),
@@ -1595,6 +1606,7 @@ class Agent(Generic[_ExpectedContentType]):
                             content_type="str",
                             tool_name=None,
                             tool_call_id=None,
+                            tool_call_args=None,
                             response_id=getattr(chunk, "id", None),
                             created_timestamp=getattr(chunk, "created", None),
                             model_used=getattr(chunk, "model", None),
@@ -1619,6 +1631,7 @@ class Agent(Generic[_ExpectedContentType]):
                             content_type="completion",
                             tool_name=None,
                             tool_call_id=None,
+                            tool_call_args=None,
                             response_id=getattr(chunk, "id", None),
                             created_timestamp=getattr(chunk, "created", None),
                             model_used=getattr(chunk, "model", None),
@@ -1637,6 +1650,7 @@ class Agent(Generic[_ExpectedContentType]):
                     content_type="error",
                     tool_name=None,
                     tool_call_id=None,
+                    tool_call_args=None,
                     response_id=None,
                     created_timestamp=None,
                     model_used=None,
@@ -1655,6 +1669,7 @@ class Agent(Generic[_ExpectedContentType]):
                         content_type="tool_call",
                         tool_name=call_name,
                         tool_call_id=call_id or f"call_{call_name}",
+                        tool_call_args=call_args or None,
                         response_id=None,
                         created_timestamp=None,
                         model_used=None,
@@ -1693,6 +1708,7 @@ class Agent(Generic[_ExpectedContentType]):
                         content_type="tool_result",
                         tool_name=call_name,
                         tool_call_id=call_id or f"call_{call_name}",
+                        tool_call_args=None,
                         response_id=None,
                         created_timestamp=None,
                         model_used=None,
@@ -1742,6 +1758,7 @@ class Agent(Generic[_ExpectedContentType]):
             content_type="error",
             tool_name=None,
             tool_call_id=None,
+            tool_call_args=None,
             response_id=None,
             created_timestamp=None,
             model_used=None,
