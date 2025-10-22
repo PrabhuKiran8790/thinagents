@@ -12,8 +12,13 @@ setup(
     packages=find_packages(exclude=[
         "tests", "tests.*", 
         "examples", "examples.*",
+        "scripts", "scripts.*",
         "thinagents.frontend", "thinagents.frontend.*"
     ]),
+    package_data={
+        "thinagents.web": ["ui/build/**/*"],
+    },
+    include_package_data=True,
     python_requires=">=3.10",
     install_requires=[
         "litellm>=1.70.0",

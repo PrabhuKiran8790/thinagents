@@ -4,9 +4,7 @@ __pycache__/
 *$py.class
 *.so
 .Python
-build/
 develop-eggs/
-dist/
 downloads/
 eggs/
 .eggs/
@@ -16,9 +14,16 @@ parts/
 sdist/
 var/
 wheels/
+share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
+
+# Build directories (except UI build which needs to be shipped)
+build/
+!thinagents/web/ui/build/
+dist/
 
 # Virtual Environment
 venv/
@@ -47,26 +52,6 @@ coverage.xml
 *.cover
 .hypothesis/
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
 # Jupyter Notebook
 .ipynb_checkpoints
 
@@ -74,8 +59,7 @@ MANIFEST
 *.log
 logs/
 
-
-# everything in the tests folder
+# Development files (not needed in package)
 tests/*
 examples/*
 thinagents_docs/*

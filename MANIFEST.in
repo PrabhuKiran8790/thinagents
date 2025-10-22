@@ -1,5 +1,11 @@
 include README.md
+
+# Exclude frontend source code
 recursive-exclude thinagents/frontend *
 recursive-exclude tests *
 recursive-exclude examples *
+recursive-exclude scripts *
+
+# Include built UI files
+recursive-include thinagents/web/ui/build *
 
