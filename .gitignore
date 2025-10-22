@@ -79,3 +79,4 @@ logs/
 tests/*
 examples/*
 thinagents_docs/*
+scripts/*
