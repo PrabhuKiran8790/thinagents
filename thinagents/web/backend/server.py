@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,6 +8,7 @@ import asyncio
 import thinagents
 from thinagents.core.response_models import ThinagentResponseStream
 from typing import Any
+from pydantic import BaseModel
 
 agent: thinagents.Agent | None = None
 
@@ -15,77 +16,92 @@ agent: thinagents.Agent | None = None
 def serialize_agent(agent: thinagents.Agent) -> dict:
     tools = getattr(agent, "tools", [])
     tool_names = [getattr(t, "name", str(t)) for t in tools]
-    
+
     data = {
         "name": getattr(agent, "name", "Unnamed Agent"),
         "model": getattr(agent, "model", None),
         "tools": tool_names,
-        "sub_agents": []
+        "sub_agents": [],
     }
-    
+
     sub_agents = getattr(agent, "sub_agents", None) or getattr(agent, "children", None)
     if sub_agents:
         data["sub_agents"] = [serialize_agent(a) for a in sub_agents]
-    
+
     return data
 
 
 def format_chunk(chunk: ThinagentResponseStream[Any]) -> dict:
     """Format streaming chunk for SSE"""
-    if hasattr(chunk, 'content_type'):
+    if hasattr(chunk, "content_type"):
         content_type = chunk.content_type
-        content = getattr(chunk, 'content', '')
-        
-        if content_type == 'tool_call':
+        content = getattr(chunk, "content", "")
+
+        if content_type == "tool_call":
             return {
-                'type': 'tool_call',
-                'tool_name': getattr(chunk, 'tool_name', 'unknown'),
-                'content': content,
-                'tool_call_args': getattr(chunk, 'tool_call_args', {})
+                "type": "tool_call",
+                "tool_name": getattr(chunk, "tool_name", "unknown"),
+                "content": content,
+                "tool_call_args": getattr(chunk, "tool_call_args", {}),
+                "tool_call_id": getattr(chunk, "tool_call_id", "unknown"),
             }
-        elif content_type == 'tool_result':
+        elif content_type == "tool_result":
             return {
-                'type': 'tool_result',
-                'tool_name': getattr(chunk, 'tool_name', 'unknown'),
-                'content': content
+                "type": "tool_result",
+                "tool_name": getattr(chunk, "tool_name", "unknown"),
+                "content": content,
+                "tool_status": getattr(chunk, "tool_status", "unknown"),
+                "tool_call_id": getattr(chunk, "tool_call_id", "unknown"),
             }
-        elif content_type == 'completion':
-            return {'type': 'text', 'content': ''}
+        elif content_type == "completion":
+            return {
+                "type": "text",
+                "content": "",
+                "response_id": getattr(chunk, "response_id", "unknown"),
+                "finish_reason": getattr(chunk, "finish_reason", "unknown"),
+            }
         else:
-            return {'type': 'text', 'content': content}
-    
+            return {
+                "type": "text",
+                "content": content,
+                "response_id": getattr(chunk, "response_id", "unknown"),
+                "finish_reason": getattr(chunk, "finish_reason", "unknown"),
+            }
+
     if isinstance(chunk, str):
-        return {'type': 'text', 'content': chunk}
+        return {"type": "text", "content": chunk}
     elif isinstance(chunk, dict):
-        return {'type': 'text', 'content': chunk.get('content', '')}
-    elif hasattr(chunk, 'content'):
-        return {'type': 'text', 'content': chunk.content}
+        return {"type": "text", "content": chunk.get("content", "")}
+    elif hasattr(chunk, "content"):
+        return {"type": "text", "content": chunk.content}
     else:
-        return {'type': 'text', 'content': str(chunk)}
+        return {"type": "text", "content": str(chunk)}
 
 
 async def stream_agent(input_text):
     if agent is None:
         yield "Error: No agent configured"
         return
-        
-    if hasattr(agent, 'astream'):
+
+    if hasattr(agent, "astream"):
         async for chunk in agent.astream(input_text, stream_intermediate_steps=True):
             yield chunk
-    elif hasattr(agent, 'stream'):
+    elif hasattr(agent, "stream"):
         for chunk in agent.run(input_text, stream=True, stream_intermediate_steps=True):
             yield chunk
             await asyncio.sleep(0)
-    elif hasattr(agent, 'arun'):
-        result = await agent.arun(input_text, stream=True, stream_intermediate_steps=True)
-        if hasattr(result, '__aiter__'):
+    elif hasattr(agent, "arun"):
+        result = await agent.arun(
+            input_text, stream=True, stream_intermediate_steps=True
+        )
+        if hasattr(result, "__aiter__"):
             async for chunk in result:
                 yield chunk
         else:
             yield result
     else:
         result = agent.run(input_text, stream=True, stream_intermediate_steps=True)
-        if hasattr(result, '__iter__') and not isinstance(result, (str, dict)):
+        if hasattr(result, "__iter__") and not isinstance(result, (str, dict)):
             for chunk in result:
                 yield chunk
                 await asyncio.sleep(0)
@@ -115,13 +131,14 @@ async def agent_info():
     return serialize_agent(agent)
 
 
+
+
+class AgentRunRequest(BaseModel):
+    input: str
+
 @app.post("/api/agent/run")
-async def agent_run(request: Request):
-    try:
-        body = await request.json()
-        input_text = body.get("input", "")
-    except Exception:
-        input_text = ""
+async def agent_run(request: AgentRunRequest):
+    input_text = request.input
 
     async def event_generator():
         try:
@@ -140,7 +157,7 @@ async def agent_run(request: Request):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-        }
+        },
     )
 
 
@@ -148,27 +165,25 @@ ui_path = Path(__file__).parent.parent / "ui" / "build"
 
 if ui_path.exists():
     app.mount("/_app", StaticFiles(directory=ui_path / "_app"), name="app")
-    
+
     @app.get("/{full_path:path}")
     async def serve_ui(full_path: str = ""):
         if full_path.startswith("api/"):
             return
-        
+
         file_path = ui_path / full_path
         if file_path.exists() and file_path.is_file():
             return FileResponse(file_path)
-        
+
         return FileResponse(ui_path / "index.html")
 else:
+
     @app.get("/")
     async def root():
         return {
             "message": "ThinAgents Backend API (UI not built)",
             "agent": getattr(agent, "name", "Unnamed Agent") if agent else "No agent",
-            "endpoints": {
-                "info": "/api/agent/info",
-                "run": "/api/agent/run"
-            }
+            "endpoints": {"info": "/api/agent/info", "run": "/api/agent/run"},
         }
 
 

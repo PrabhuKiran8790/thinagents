@@ -1,4 +1,4 @@
-from typing import Any, Optional, TypeVar, Generic
+from typing import Any, Dict, Optional, TypeVar, Generic
 from pydantic import BaseModel, Field, ConfigDict
 
 
@@ -46,7 +46,8 @@ class ThinagentResponse(BaseModel, Generic[_ContentType]):
     artifact: Optional[Any] = Field(None, description="For any additional data from the LLM provider not covered by other fields. Defaults to None.")
     tool_name: Optional[str] = Field(None, description="Name of the tool associated with this response chunk, if applicable.")
     tool_call_id: Optional[str] = Field(None, description="Unique identifier of the tool call that produced this chunk, if applicable.")
-    tool_call_args: Optional[str] = Field(None, description="JSON string of arguments for the tool call, if applicable.")
+    tool_call_args: Optional[Dict[str, Any]] = Field(None, description="Parsed arguments for the tool call as a dictionary, if applicable.")
+    tool_status: Optional[str] = Field(None, description="Status of tool execution: 'success', 'failed', or None for non-tool responses.")
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="ignore")
 
 

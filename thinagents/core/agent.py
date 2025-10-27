@@ -628,6 +628,7 @@ class Agent(Generic[_ExpectedContentType]):
                     "error": str(e),
                     "message": "Failed to parse arguments",
                 }),
+                "status": "failed",
             }
 
         try:
@@ -645,6 +646,7 @@ class Agent(Generic[_ExpectedContentType]):
                 "role": "tool",
                 "name": tool_call_name,
                 "content": content_for_llm,
+                "status": "success",
             }
             if self._should_include_artifacts_in_messages() and artifact is not None:
                 tool_message["artifact"] = artifact
@@ -659,6 +661,7 @@ class Agent(Generic[_ExpectedContentType]):
                     "error": str(e),
                     "message": "Tool execution failed",
                 }),
+                "status": "failed",
             }
 
     @overload
@@ -850,6 +853,7 @@ class Agent(Generic[_ExpectedContentType]):
             tool_name=None,
             tool_call_id=None,
             tool_call_args=None,
+            tool_status=None,
         )
 
     def _handle_tool_calls(self, tool_calls: List[Any], message: Any, messages: List[Dict], conversation_id: Optional[str] = None) -> None:
@@ -986,6 +990,7 @@ class Agent(Generic[_ExpectedContentType]):
                             system_fingerprint=None,
                             artifact=None,
                             stream_options=opts,
+                            tool_status=None,
                         )
                         continue
                         
@@ -1047,6 +1052,7 @@ class Agent(Generic[_ExpectedContentType]):
                                     system_fingerprint=getattr(chunk, "system_fingerprint", None),
                                     artifact=None,
                                     stream_options=None,
+                                    tool_status=None,
                                 )
                             continue
                         yield ThinagentResponseStream(
@@ -1063,6 +1069,7 @@ class Agent(Generic[_ExpectedContentType]):
                             system_fingerprint=getattr(chunk, "system_fingerprint", None),
                             artifact=None,
                             stream_options=None,
+                            tool_status=None,
                         )
                         
                     # Check for completion without tool calls
@@ -1090,6 +1097,7 @@ class Agent(Generic[_ExpectedContentType]):
                             system_fingerprint=getattr(chunk, "system_fingerprint", None),
                             artifact=None,
                             stream_options=None,
+                            tool_status=None,
                         )
                         return
                         
@@ -1109,17 +1117,25 @@ class Agent(Generic[_ExpectedContentType]):
                     system_fingerprint=None,
                     artifact=None,
                     stream_options=None,
+                    tool_status=None,
                 )
                 return
             
             if call_name:
+                tool_execution_status = "success"
+                try:
+                    parsed_args = json.loads(call_args) if call_args else {}
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse tool arguments: {e}")
+                    parsed_args = {}
+                
                 if stream_intermediate_steps:
                     yield ThinagentResponseStream(
                         content=f"<tool_call:{call_name}>",
                         content_type="tool_call",
                         tool_name=call_name,
                         tool_call_id=call_id or f"call_{call_name}",
-                        tool_call_args=call_args or None,
+                        tool_call_args=parsed_args or None,
                         response_id=None,
                         created_timestamp=None,
                         model_used=None,
@@ -1128,20 +1144,15 @@ class Agent(Generic[_ExpectedContentType]):
                         system_fingerprint=None,
                         artifact=None,
                         stream_options=None,
+                        tool_status=None,
                     )
-                
-                # Parse arguments and execute tool
-                try:
-                    parsed_args = json.loads(call_args) if call_args else {}
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse tool arguments: {e}")
-                    parsed_args = {}
                     
                 try:
                     tool_result = self._execute_tool(call_name, parsed_args)
                 except ToolExecutionError as e:
                     logger.error(f"Tool execution failed in stream: {e}")
                     tool_result = {"error": str(e), "message": "Tool execution failed"}
+                    tool_execution_status = "failed"
                 
                 # determine if the tool returned artifact along with content
                 tool_obj = self.tool_maps.get(call_name)
@@ -1170,6 +1181,7 @@ class Agent(Generic[_ExpectedContentType]):
                         system_fingerprint=None,
                         artifact=self._tool_artifacts.copy() if self._tool_artifacts else None,
                         stream_options=None,
+                        tool_status=tool_execution_status,
                     )
                 
                 # Add assistant message with tool_calls structure
@@ -1189,11 +1201,12 @@ class Agent(Generic[_ExpectedContentType]):
                 }
                 messages.append(assistant_message)
                 
-                # Append the tool response with artifact if applicable
+                # Append the tool response with artifact and status
                 tool_message: Dict[str, Any] = {
                     "role": "tool",
                     "tool_call_id": call_id or f"call_{call_name}",
                     "content": serialised_content,
+                    "status": tool_execution_status,
                 }
                 
                 # Include artifact in tool message if memory supports it and artifacts are available
@@ -1225,6 +1238,7 @@ class Agent(Generic[_ExpectedContentType]):
             system_fingerprint=None,
             artifact=None,
             stream_options=None,
+            tool_status=None,
         )
 
     def __repr__(self) -> str:
@@ -1306,6 +1320,7 @@ class Agent(Generic[_ExpectedContentType]):
                     "error": str(e),
                     "message": "Failed to parse arguments",
                 }),
+                "status": "failed",
             }
 
         try:
@@ -1323,6 +1338,7 @@ class Agent(Generic[_ExpectedContentType]):
                 "role": "tool",
                 "name": tool_call_name,
                 "content": content_for_llm,
+                "status": "success",
             }
             if self._should_include_artifacts_in_messages() and artifact is not None:
                 tool_message["artifact"] = artifact
@@ -1337,6 +1353,7 @@ class Agent(Generic[_ExpectedContentType]):
                     "error": str(e),
                     "message": "Tool execution failed",
                 }),
+                "status": "failed",
             }
 
     async def _handle_tool_calls_async(self, tool_calls: List[Any], message: Any, messages: List[Dict], conversation_id: Optional[str] = None) -> None:
@@ -1542,6 +1559,7 @@ class Agent(Generic[_ExpectedContentType]):
                             system_fingerprint=None,
                             artifact=None,
                             stream_options=opts,
+                            tool_status=None,
                         )
                         continue
 
@@ -1599,6 +1617,7 @@ class Agent(Generic[_ExpectedContentType]):
                                     system_fingerprint=getattr(chunk, "system_fingerprint", None),
                                     artifact=None,
                                     stream_options=None,
+                                    tool_status=None,
                                 )
                             continue
                         yield ThinagentResponseStream(
@@ -1615,6 +1634,7 @@ class Agent(Generic[_ExpectedContentType]):
                             system_fingerprint=getattr(chunk, "system_fingerprint", None),
                             artifact=None,
                             stream_options=None,
+                            tool_status=None,
                         )
 
                     if finish_reason == "stop":
@@ -1640,6 +1660,7 @@ class Agent(Generic[_ExpectedContentType]):
                             system_fingerprint=getattr(chunk, "system_fingerprint", None),
                             artifact=None,
                             stream_options=None,
+                            tool_status=None,
                         )
                         return
 
@@ -1659,17 +1680,25 @@ class Agent(Generic[_ExpectedContentType]):
                     system_fingerprint=None,
                     artifact=None,
                     stream_options=None,
+                    tool_status=None,
                 )
                 return
 
             if call_name:
+                tool_execution_status = "success"
+                try:
+                    parsed_args = json.loads(call_args) if call_args else {}
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse tool arguments: {e}")
+                    parsed_args = {}
+                
                 if stream_intermediate_steps:
                     yield ThinagentResponseStream(
                         content=f"<tool_call:{call_name}>",
                         content_type="tool_call",
                         tool_name=call_name,
                         tool_call_id=call_id or f"call_{call_name}",
-                        tool_call_args=call_args or None,
+                        tool_call_args=parsed_args or None,
                         response_id=None,
                         created_timestamp=None,
                         model_used=None,
@@ -1678,19 +1707,15 @@ class Agent(Generic[_ExpectedContentType]):
                         system_fingerprint=None,
                         artifact=None,
                         stream_options=None,
+                        tool_status=None,
                     )
-
-                try:
-                    parsed_args = json.loads(call_args) if call_args else {}
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse tool arguments: {e}")
-                    parsed_args = {}
 
                 try:
                     tool_result = await self._execute_tool_async(call_name, parsed_args)
                 except ToolExecutionError as e:
                     logger.error(f"Tool execution failed in async stream: {e}")
                     tool_result = {"error": str(e), "message": "Tool execution failed"}
+                    tool_execution_status = "failed"
 
                 tool_obj = self.tool_maps.get(call_name)
                 return_type = getattr(tool_obj, "return_type", "content")
@@ -1717,6 +1742,7 @@ class Agent(Generic[_ExpectedContentType]):
                         system_fingerprint=None,
                         artifact=self._tool_artifacts.copy() if self._tool_artifacts else None,
                         stream_options=None,
+                        tool_status=tool_execution_status,
                     )
 
                 assistant_message: Dict[str, Any] = {
@@ -1740,6 +1766,7 @@ class Agent(Generic[_ExpectedContentType]):
                     "role": "tool",
                     "tool_call_id": call_id or f"call_{call_name}",
                     "content": serialised_content,
+                    "status": tool_execution_status,
                 }
                 
                 # Include artifact in tool message if memory supports it and artifacts are available
@@ -1767,6 +1794,7 @@ class Agent(Generic[_ExpectedContentType]):
             system_fingerprint=None,
             artifact=None,
             stream_options=None,
+            tool_status=None,
         )
 
     @overload
