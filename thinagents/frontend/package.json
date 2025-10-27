@@ -43,6 +43,8 @@
         "vite": "^7.1.7"
     },
     "dependencies": {
+        "@dagrejs/dagre": "^1.1.5",
+        "@xyflow/svelte": "^1.4.0",
         "ai": "^5.0.76",
         "mode-watcher": "^1.1.0",
         "runed": "^0.35.1",

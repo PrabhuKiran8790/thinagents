@@ -4,6 +4,8 @@ import threading
 import subprocess
 import time
 import sys
+import os
+import signal
 from pathlib import Path
 
 
@@ -26,6 +28,8 @@ class WebUI:
         self.port = port
         self.dev_mode = dev_mode
         self._frontend_process = None
+        self._backend_process = None
+        self._file_watcher = None
 
     def run(self, host=None, port=None, open_browser=True, dev_mode=None):
         host = host or self.host
@@ -48,7 +52,9 @@ class WebUI:
     def _run_dev(self, host, port, open_browser):
         frontend_port = 5173
         print(f"\n🚀 ThinAgents Web UI (DEV)\n📍 Backend: http://{host}:{port}\n📍 Frontend: http://{host}:{frontend_port}\n")
+        print("🔄 Auto-reload enabled for backend and main script\n")
         
+        self._start_file_watcher()
         self._start_backend(host, port)
         time.sleep(2)
         self._start_frontend(host, frontend_port)
@@ -79,12 +85,50 @@ class WebUI:
         
         uvicorn.run(app, host=host, port=port, log_level="warning")
 
+    def _start_file_watcher(self):
+        try:
+            from watchdog.observers import Observer
+            from watchdog.events import FileSystemEventHandler
+            
+            class RestartHandler(FileSystemEventHandler):
+                def __init__(self, script_path):
+                    self.script_path = script_path
+                    self.last_restart = 0
+                    
+                def on_modified(self, event):
+                    if event.src_path == self.script_path:
+                        current_time = time.time()
+                        if current_time - self.last_restart > 1:
+                            self.last_restart = current_time
+                            print(f"\n🔄 Detected change in {Path(self.script_path).name}, restarting...\n")
+                            os.kill(os.getpid(), signal.SIGTERM)
+            
+            main_script = sys.argv[0]
+            if main_script and os.path.exists(main_script):
+                main_script = os.path.abspath(main_script)
+                watch_dir = os.path.dirname(main_script)
+                
+                event_handler = RestartHandler(main_script)
+                observer = Observer()
+                observer.schedule(event_handler, watch_dir, recursive=False)
+                observer.start()
+                self._file_watcher = observer
+        except ImportError:
+            print("⚠️  watchdog not installed. Main script auto-reload disabled.")
+            print("   Install with: pip install 'thinagents[web]' or pip install watchdog")
+    
     def _start_backend(self, host, port):
         from .server import create_app
+        
         app = create_app(self.agent)
         
         def run():
-            uvicorn.run(app, host=host, port=port, log_level="warning")
+            uvicorn.run(
+                app,
+                host=host,
+                port=port,
+                log_level="warning"
+            )
         
         threading.Thread(target=run, daemon=True).start()
 
@@ -101,6 +145,17 @@ class WebUI:
             sys.exit(1)
 
     def stop(self):
+        if self._file_watcher:
+            self._file_watcher.stop()
+            self._file_watcher.join()
+        
+        if self._backend_process:
+            self._backend_process.terminate()
+            try:
+                self._backend_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._backend_process.kill()
+        
         if self._frontend_process:
             self._frontend_process.terminate()
             try:

@@ -14,13 +14,17 @@ agent: thinagents.Agent | None = None
 
 
 def serialize_agent(agent: thinagents.Agent) -> dict:
-    tools = getattr(agent, "tools", [])
-    tool_names = [getattr(t, "name", str(t)) for t in tools]
+    tools = agent.tool_schemas
+    
+    filtered_tools = [
+        tool for tool in tools 
+        if not tool.get("function", {}).get("name", "").startswith("subagent")
+    ]
 
     data = {
         "name": getattr(agent, "name", "Unnamed Agent"),
         "model": getattr(agent, "model", None),
-        "tools": tool_names,
+        "tools": filtered_tools,
         "sub_agents": [],
     }
 

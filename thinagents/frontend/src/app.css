@@ -138,3 +138,7 @@ input[type='color'] {
 	border: none; /* Optional: To remove the border if needed */
 	background: none; /* Optional: To remove the default color picker background */
 }
+
+.svelte-flow__background {
+	@apply bg-background;
+}

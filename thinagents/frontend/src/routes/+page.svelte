@@ -315,7 +315,7 @@
 								{#if message.items && message.items.length > 0}
 									{#each message.items as item, idx (idx)}
 										{#if item.type === 'text'}
-											<Response content={item.content} class="text-primary/90 text-sm" />
+											<Response content={item.content} class="text-sm" />
 										{:else if item.type === 'tool_call'}
 											<ToolCallResult
 												toolName={item.data.name}
@@ -328,7 +328,7 @@
 										{/if}
 									{/each}
 								{:else if message.content}
-									<Response content={message.content} class="text-primary/90 text-sm" />
+									<Response content={message.content} class="text-sm" />
 								{/if}
 							</div>
 						{/if}
