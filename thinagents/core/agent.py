@@ -264,6 +264,7 @@ class Agent(Generic[_ExpectedContentType]):
         self._stream_subagents = False
         self._is_subagent = False
         self._sub_agent_map: Dict[str, "Agent"] = {}
+        self._current_conversation_id: Optional[str] = None
 
         self._initialize_tools()
 
@@ -363,7 +364,7 @@ class Agent(Generic[_ExpectedContentType]):
                 if self._is_streaming and self._stream_intermediate_steps:
                     return {"__subagent_stream__": True, "agent": sa, "input": input}
                 else:
-                    return sa.run(input, _is_subagent_call=True)
+                    return sa.run(input, conversation_id=self._current_conversation_id, _is_subagent_call=True)
             except Exception as e:
                 logger.error(f"Sub-agent '{sa.name}' execution failed: {e}")
                 raise ToolExecutionError(f"Sub-agent execution failed: {e}") from e
@@ -736,6 +737,7 @@ class Agent(Generic[_ExpectedContentType]):
             raise ValueError("Input must be a non-empty string")
         
         self._is_subagent = _is_subagent_call
+        self._current_conversation_id = conversation_id
         
         # Previously we fully blocked sync runs when MCP servers were configured.
         # This was overly restrictive—sync runs are safe as long as the model does not
@@ -1211,7 +1213,7 @@ class Agent(Generic[_ExpectedContentType]):
                         accumulated_subagent_content = ""
                         sub_input = tool_result["input"]
 
-                        for sub_chunk in sub_agent.run(sub_input, stream=True, stream_intermediate_steps=True, _is_subagent_call=True):
+                        for sub_chunk in sub_agent.run(sub_input, stream=True, stream_intermediate_steps=True, conversation_id=self._current_conversation_id, _is_subagent_call=True):
                             if stream_intermediate_steps:
                                 if self._stream_subagents:
                                     yield sub_chunk
@@ -1820,7 +1822,7 @@ class Agent(Generic[_ExpectedContentType]):
                     
                     if isinstance(sub_agent, Agent):
                         accumulated_subagent_content = ""
-                        sub_stream = await sub_agent.arun(sub_input, stream=True, stream_intermediate_steps=True, _is_subagent_call=True)
+                        sub_stream = await sub_agent.arun(sub_input, stream=True, stream_intermediate_steps=True, conversation_id=self._current_conversation_id, _is_subagent_call=True)
                         async for sub_chunk in sub_stream:
                             if stream_intermediate_steps:
                                 if self._stream_subagents:
@@ -1961,6 +1963,7 @@ class Agent(Generic[_ExpectedContentType]):
             raise ValueError("Input must be a non-empty string")
 
         self._is_subagent = _is_subagent_call
+        self._current_conversation_id = conversation_id
 
         logger.info(f"Agent '{self.name}' starting async execution with input length: {len(input)}")
 
