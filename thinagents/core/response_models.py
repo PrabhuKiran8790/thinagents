@@ -48,6 +48,8 @@ class ThinagentResponse(BaseModel, Generic[_ContentType]):
     tool_call_id: Optional[str] = Field(None, description="Unique identifier of the tool call that produced this chunk, if applicable.")
     tool_call_args: Optional[Dict[str, Any]] = Field(None, description="Parsed arguments for the tool call as a dictionary, if applicable.")
     tool_status: Optional[str] = Field(None, description="Status of tool execution: 'success', 'failed', or None for non-tool responses.")
+    agent_name: Optional[str] = Field(None, description="Name of the agent that generated this response or tool call. Useful for tracking nested sub-agent executions.")
+    is_subagent: bool = Field(False, description="True if this response/tool call is from a sub-agent, False if from the root agent.")
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="ignore")
 
 

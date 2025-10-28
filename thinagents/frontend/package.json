@@ -46,8 +46,9 @@
         "@dagrejs/dagre": "^1.1.5",
         "@xyflow/svelte": "^1.4.0",
         "ai": "^5.0.76",
+        "carta-md": "4.11.1",
+        "isomorphic-dompurify": "^2.20.0",
         "mode-watcher": "^1.1.0",
-        "runed": "^0.35.1",
-        "svelte-streamdown": "^2.5.2"
+        "runed": "^0.35.1"
     }
 }

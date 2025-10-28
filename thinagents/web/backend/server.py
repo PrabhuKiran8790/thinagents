@@ -40,6 +40,8 @@ def format_chunk(chunk: ThinagentResponseStream[Any]) -> dict:
     if hasattr(chunk, "content_type"):
         content_type = chunk.content_type
         content = getattr(chunk, "content", "")
+        agent_name = getattr(chunk, "agent_name", None)
+        is_subagent = getattr(chunk, "is_subagent", False)
 
         if content_type == "tool_call":
             return {
@@ -48,6 +50,8 @@ def format_chunk(chunk: ThinagentResponseStream[Any]) -> dict:
                 "content": content,
                 "tool_call_args": getattr(chunk, "tool_call_args", {}),
                 "tool_call_id": getattr(chunk, "tool_call_id", "unknown"),
+                "agent_name": agent_name,
+                "is_subagent": is_subagent,
             }
         elif content_type == "tool_result":
             return {
@@ -56,6 +60,8 @@ def format_chunk(chunk: ThinagentResponseStream[Any]) -> dict:
                 "content": content,
                 "tool_status": getattr(chunk, "tool_status", "unknown"),
                 "tool_call_id": getattr(chunk, "tool_call_id", "unknown"),
+                "agent_name": agent_name,
+                "is_subagent": is_subagent,
             }
         elif content_type == "completion":
             return {
@@ -63,6 +69,8 @@ def format_chunk(chunk: ThinagentResponseStream[Any]) -> dict:
                 "content": "",
                 "response_id": getattr(chunk, "response_id", "unknown"),
                 "finish_reason": getattr(chunk, "finish_reason", "unknown"),
+                "agent_name": agent_name,
+                "is_subagent": is_subagent,
             }
         else:
             return {
@@ -70,6 +78,8 @@ def format_chunk(chunk: ThinagentResponseStream[Any]) -> dict:
                 "content": content,
                 "response_id": getattr(chunk, "response_id", "unknown"),
                 "finish_reason": getattr(chunk, "finish_reason", "unknown"),
+                "agent_name": agent_name,
+                "is_subagent": is_subagent,
             }
 
     if isinstance(chunk, str):

@@ -258,6 +258,12 @@ class Agent(Generic[_ExpectedContentType]):
             self._mcp_manager.add_servers(self._mcp_servers_config)
 
         self._mcp_tools_loaded: bool = False
+        
+        self._is_streaming = False
+        self._stream_intermediate_steps = False
+        self._stream_subagents = False
+        self._is_subagent = False
+        self._sub_agent_map: Dict[str, "Agent"] = {}
 
         self._initialize_tools()
 
@@ -349,19 +355,25 @@ class Agent(Generic[_ExpectedContentType]):
     def _make_sub_agent_tool(self, sa: "Agent") -> ThinAgentsTool:
         """Create a ThinAgents tool that delegates calls to a sub-agent."""
         safe_name = sa.name.lower().strip().replace(" ", "_")
+        tool_name = f"subagent_{safe_name}"
 
         def _delegate_to_sub_agent(input: str) -> Any:
             """Delegate input to the sub-agent."""
             try:
-                return sa.run(input)
+                if self._is_streaming and self._stream_intermediate_steps:
+                    return {"__subagent_stream__": True, "agent": sa, "input": input}
+                else:
+                    return sa.run(input, _is_subagent_call=True)
             except Exception as e:
                 logger.error(f"Sub-agent '{sa.name}' execution failed: {e}")
                 raise ToolExecutionError(f"Sub-agent execution failed: {e}") from e
 
-        _delegate_to_sub_agent.__name__ = f"subagent_{safe_name}"
+        _delegate_to_sub_agent.__name__ = tool_name
         _delegate_to_sub_agent.__doc__ = sa.description or (
             f"Forward the input to the '{sa.name}' sub-agent and return its response."
         )
+        
+        self._sub_agent_map[tool_name] = sa
 
         return tool_decorator(_delegate_to_sub_agent)
 
@@ -670,8 +682,10 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         stream: Literal[False] = False,
         stream_intermediate_steps: bool = False,
+        stream_subagents: bool = False,
         conversation_id: Optional[str] = None,
         prompt_vars: Optional[Dict[str, Any]] = None,
+        _is_subagent_call: bool = False,
     ) -> ThinagentResponse[_ExpectedContentType]:
         ...
     @overload
@@ -680,8 +694,10 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         stream: Literal[True],
         stream_intermediate_steps: bool = False,
+        stream_subagents: bool = False,
         conversation_id: Optional[str] = None,
         prompt_vars: Optional[Dict[str, Any]] = None,
+        _is_subagent_call: bool = False,
     ) -> Iterator[ThinagentResponseStream[Any]]:
         ...
     def run(
@@ -689,8 +705,10 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         stream: bool = False,
         stream_intermediate_steps: bool = False,
+        stream_subagents: bool = False,
         conversation_id: Optional[str] = None,
         prompt_vars: Optional[Dict[str, Any]] = None,
+        _is_subagent_call: bool = False,
     ) -> Any:
         """
         Run the agent with the given input and manage interactions with the language model and tools.
@@ -699,8 +717,12 @@ class Agent(Generic[_ExpectedContentType]):
             input: The user's input message to the agent.
             stream: If True, returns a stream of responses instead of a single response.
             stream_intermediate_steps: If True and stream=True, also stream intermediate tool calls and results.
+            stream_subagents: If True and stream=True and stream_intermediate_steps=True, also stream sub-agent 
+                text responses character-by-character. If False (default), only shows sub-agent tool calls and 
+                results without streaming the sub-agent's text output.
             conversation_id: Optional conversation ID for memory retrieval
             prompt_vars: Optional dictionary of variables to substitute into the prompt template.
+            _is_subagent_call: Internal parameter to track if this is a sub-agent call.
 
         Returns:
             ThinagentResponse[_ExpectedContentType] when stream=False, or Iterator[ThinagentResponseStream] when stream=True.
@@ -713,6 +735,8 @@ class Agent(Generic[_ExpectedContentType]):
         if not input or not isinstance(input, str):
             raise ValueError("Input must be a non-empty string")
         
+        self._is_subagent = _is_subagent_call
+        
         # Previously we fully blocked sync runs when MCP servers were configured.
         # This was overly restrictive—sync runs are safe as long as the model does not
         # ask to call an async-only MCP tool.  The guard is still enforced inside
@@ -724,7 +748,7 @@ class Agent(Generic[_ExpectedContentType]):
         if stream:
             if self.response_format_model_type:
                 raise ValueError("Streaming is not supported when response_format is specified.")
-            return self._run_stream(input, stream_intermediate_steps, conversation_id, prompt_vars=prompt_vars)
+            return self._run_stream(input, stream_intermediate_steps, stream_subagents, conversation_id, prompt_vars=prompt_vars)
 
         try:
             return self._run_sync(input, conversation_id, prompt_vars=prompt_vars)
@@ -854,6 +878,8 @@ class Agent(Generic[_ExpectedContentType]):
             tool_call_id=None,
             tool_call_args=None,
             tool_status=None,
+                            agent_name=self.name,
+                            is_subagent=self._is_subagent,
         )
 
     def _handle_tool_calls(self, tool_calls: List[Any], message: Any, messages: List[Dict], conversation_id: Optional[str] = None) -> None:
@@ -940,27 +966,40 @@ class Agent(Generic[_ExpectedContentType]):
         self,
         input: str,
         stream_intermediate_steps: bool = False,
+        stream_subagents: bool = False,
         conversation_id: Optional[str] = None,
         prompt_vars: Optional[Dict[str, Any]] = None,
     ) -> Iterator[ThinagentResponseStream[Any]]:
         """
         Streamed version of run; yields ThinagentResponseStream chunks, including interleaved tool calls/results if requested.
         """
-        messages = self._prepare_stream(input, conversation_id, prompt_vars=prompt_vars)
-        logger.info(f"Agent '{self.name}' starting streaming execution")
+        self._is_streaming = True
+        self._stream_intermediate_steps = stream_intermediate_steps
+        self._stream_subagents = stream_subagents
         
-        step_count = 0
-        accumulated_content = ""
-        arg_accumulators: Dict[str, str] = {}
+        try:
+            messages = self._prepare_stream(input, conversation_id, prompt_vars=prompt_vars)
+            logger.info(f"Agent '{self.name}' starting streaming execution")
+            
+            step_count = 0
+            accumulated_content = ""
+            arg_accumulators: Dict[str, str] = {}
 
+            yield from self._run_stream_impl(messages, step_count, accumulated_content, arg_accumulators, stream_intermediate_steps, conversation_id)
+        finally:
+            self._is_streaming = False
+            self._stream_intermediate_steps = False
+            self._stream_subagents = False
+
+    def _run_stream_impl(self, messages, step_count, accumulated_content, arg_accumulators, stream_intermediate_steps, conversation_id):
         while step_count < self.max_steps:
             step_count += 1
-            
+
             call_name: Optional[str] = None
             call_args: str = ""
             call_id: Optional[str] = None
             final_finish_reason: Optional[str] = None
-            
+
             try:    
                 for chunk in litellm_completion(
                     model=self.model,
@@ -973,7 +1012,7 @@ class Agent(Generic[_ExpectedContentType]):
                     stream=True,
                     **self.kwargs,
                 ):
-                    
+
                     if isinstance(chunk, tuple) and len(chunk) == 2:
                         raw, opts = chunk
                         yield ThinagentResponseStream(
@@ -991,21 +1030,23 @@ class Agent(Generic[_ExpectedContentType]):
                             artifact=None,
                             stream_options=opts,
                             tool_status=None,
+                            agent_name=self.name,
+                            is_subagent=self._is_subagent,
                         )
                         continue
-                        
+
                     try:
                         sc = chunk.choices[0]  # type: ignore
                         delta = getattr(sc, "delta", None)
                         finish_reason = getattr(sc, "finish_reason", None)
-                        
+
                         if finish_reason is not None:
                             final_finish_reason = finish_reason
-                            
+
                     except (IndexError, AttributeError):
                         logger.warning("Invalid chunk structure in stream")
                         continue
-                    
+
                     tool_calls = getattr(delta, "tool_calls", None)
                     if tool_calls:
                         for tc in tool_calls:
@@ -1019,7 +1060,7 @@ class Agent(Generic[_ExpectedContentType]):
                                 if tc.function.arguments is not None and call_id is not None:
                                     arg_accumulators[call_id] = arg_accumulators.get(call_id, "") + tc.function.arguments
                                     call_args = arg_accumulators[call_id]
-                    
+
                     fc = getattr(delta, "function_call", None)
                     if fc is not None:
                         if fc.name:
@@ -1027,11 +1068,11 @@ class Agent(Generic[_ExpectedContentType]):
                         if fc.arguments is not None and call_id is not None:
                             arg_accumulators[call_id] = arg_accumulators.get(call_id, "") + fc.arguments
                             call_args = arg_accumulators[call_id]
-                    
+
                     # Check if tool/function call is complete
                     if finish_reason in ["tool_calls", "function_call"]:
                         break
-                    
+
                     # Otherwise, stream content tokens
                     text = getattr(delta, "content", None)
                     if text:
@@ -1053,6 +1094,8 @@ class Agent(Generic[_ExpectedContentType]):
                                     artifact=None,
                                     stream_options=None,
                                     tool_status=None,
+                            agent_name=self.name,
+                            is_subagent=self._is_subagent,
                                 )
                             continue
                         yield ThinagentResponseStream(
@@ -1070,8 +1113,10 @@ class Agent(Generic[_ExpectedContentType]):
                             artifact=None,
                             stream_options=None,
                             tool_status=None,
+                            agent_name=self.name,
+                            is_subagent=self._is_subagent,
                         )
-                        
+
                     # Check for completion without tool calls
                     if finish_reason == "stop":
                         # Save accumulated content to memory if available
@@ -1080,7 +1125,7 @@ class Agent(Generic[_ExpectedContentType]):
                             messages.append(final_assistant_message)
                             self._save_messages_to_memory(messages, conversation_id)
                             logger.info(f"Saved final streaming response to memory for conversation '{conversation_id}'")
-                            
+
                         logger.info(f"Agent '{self.name}' streaming completed successfully")
                         # Emit a final completion chunk to signal the end
                         yield ThinagentResponseStream(
@@ -1098,9 +1143,11 @@ class Agent(Generic[_ExpectedContentType]):
                             artifact=None,
                             stream_options=None,
                             tool_status=None,
+                            agent_name=self.name,
+                            is_subagent=self._is_subagent,
                         )
                         return
-                        
+
             except Exception as e:
                 logger.error(f"Streaming error: {e}")
                 yield ThinagentResponseStream(
@@ -1118,9 +1165,11 @@ class Agent(Generic[_ExpectedContentType]):
                     artifact=None,
                     stream_options=None,
                     tool_status=None,
+                            agent_name=self.name,
+                            is_subagent=self._is_subagent,
                 )
                 return
-            
+
             if call_name:
                 tool_execution_status = "success"
                 try:
@@ -1128,7 +1177,7 @@ class Agent(Generic[_ExpectedContentType]):
                 except json.JSONDecodeError as e:
                     logger.error(f"Failed to parse tool arguments: {e}")
                     parsed_args = {}
-                
+
                 if stream_intermediate_steps:
                     yield ThinagentResponseStream(
                         content=f"<tool_call:{call_name}>",
@@ -1145,16 +1194,35 @@ class Agent(Generic[_ExpectedContentType]):
                         artifact=None,
                         stream_options=None,
                         tool_status=None,
+                            agent_name=self.name,
+                            is_subagent=self._is_subagent,
                     )
-                    
+
                 try:
                     tool_result = self._execute_tool(call_name, parsed_args)
                 except ToolExecutionError as e:
                     logger.error(f"Tool execution failed in stream: {e}")
                     tool_result = {"error": str(e), "message": "Tool execution failed"}
                     tool_execution_status = "failed"
-                
-                # determine if the tool returned artifact along with content
+
+                if isinstance(tool_result, dict) and tool_result.get("__subagent_stream__"):
+                    sub_agent = tool_result["agent"]
+                    if isinstance(sub_agent, Agent):
+                        accumulated_subagent_content = ""
+                        sub_input = tool_result["input"]
+
+                        for sub_chunk in sub_agent.run(sub_input, stream=True, stream_intermediate_steps=True, _is_subagent_call=True):
+                            if stream_intermediate_steps:
+                                if self._stream_subagents:
+                                    yield sub_chunk
+                                elif sub_chunk.content_type in ["tool_call", "tool_result"]:
+                                    yield sub_chunk
+
+                            if sub_chunk.content_type == "str":
+                                accumulated_subagent_content += sub_chunk.content
+
+                        tool_result = accumulated_subagent_content or "Sub-agent completed successfully"
+
                 tool_obj = self.tool_maps.get(call_name)
                 return_type = getattr(tool_obj, "return_type", "content")
                 artifact_payload = None
@@ -1167,6 +1235,9 @@ class Agent(Generic[_ExpectedContentType]):
 
                 # Optionally emit tool result with artifact (only for tool_result chunks and finish_reason==tool_calls)
                 if stream_intermediate_steps:
+                    is_subagent_tool = call_name in self._sub_agent_map
+                    subagent_name = self._sub_agent_map[call_name].name if is_subagent_tool else self.name
+                    
                     yield ThinagentResponseStream(
                         content=serialised_content,
                         content_type="tool_result",
@@ -1182,8 +1253,10 @@ class Agent(Generic[_ExpectedContentType]):
                         artifact=self._tool_artifacts.copy() if self._tool_artifacts else None,
                         stream_options=None,
                         tool_status=tool_execution_status,
+                        agent_name=subagent_name,
+                        is_subagent=is_subagent_tool,
                     )
-                
+
                 # Add assistant message with tool_calls structure
                 assistant_message: Dict[str, Any] = {
                     "role": "assistant",
@@ -1200,7 +1273,7 @@ class Agent(Generic[_ExpectedContentType]):
                     ]
                 }
                 messages.append(assistant_message)
-                
+
                 # Append the tool response with artifact and status
                 tool_message: Dict[str, Any] = {
                     "role": "tool",
@@ -1208,20 +1281,20 @@ class Agent(Generic[_ExpectedContentType]):
                     "content": serialised_content,
                     "status": tool_execution_status,
                 }
-                
+
                 # Include artifact in tool message if memory supports it and artifacts are available
                 if self._should_include_artifacts_in_messages() and artifact_payload is not None:
                     tool_message["artifact"] = artifact_payload
-                
+
                 messages.append(tool_message)
                 if self.memory and conversation_id:
                     self._save_messages_to_memory(messages, conversation_id)
 
-                
+
                 continue
-            
+
             break
-            
+
         # Max steps reached in streaming
         logger.warning(f"Agent '{self.name}' reached max steps in streaming mode")
         yield ThinagentResponseStream(
@@ -1239,6 +1312,8 @@ class Agent(Generic[_ExpectedContentType]):
             artifact=None,
             stream_options=None,
             tool_status=None,
+                            agent_name=self.name,
+                            is_subagent=self._is_subagent,
         )
 
     def __repr__(self) -> str:
@@ -1509,15 +1584,19 @@ class Agent(Generic[_ExpectedContentType]):
         self,
         input: str,
         stream_intermediate_steps: bool = False,
+        stream_subagents: bool = False,
         conversation_id: Optional[str] = None,
         prompt_vars: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[ThinagentResponseStream[Any]]:
+        self._is_streaming = True
+        self._stream_intermediate_steps = stream_intermediate_steps
+        self._stream_subagents = stream_subagents
+        
         logger.info(f"Agent '{self.name}' starting async streaming execution")
 
-        # Ensure MCP tools are loaded before proceeding
         await self._ensure_mcp_tools_loaded()
         messages = await self._aprepare_stream(input, conversation_id, prompt_vars=prompt_vars)
-        accumulated_content = ""  # Track accumulated content for memory
+        accumulated_content = ""
 
         step_count = 0
         arg_accumulators: Dict[str, str] = {}
@@ -1560,6 +1639,8 @@ class Agent(Generic[_ExpectedContentType]):
                             artifact=None,
                             stream_options=opts,
                             tool_status=None,
+                            agent_name=self.name,
+                            is_subagent=self._is_subagent,
                         )
                         continue
 
@@ -1618,6 +1699,8 @@ class Agent(Generic[_ExpectedContentType]):
                                     artifact=None,
                                     stream_options=None,
                                     tool_status=None,
+                            agent_name=self.name,
+                            is_subagent=self._is_subagent,
                                 )
                             continue
                         yield ThinagentResponseStream(
@@ -1635,6 +1718,8 @@ class Agent(Generic[_ExpectedContentType]):
                             artifact=None,
                             stream_options=None,
                             tool_status=None,
+                            agent_name=self.name,
+                            is_subagent=self._is_subagent,
                         )
 
                     if finish_reason == "stop":
@@ -1661,7 +1746,12 @@ class Agent(Generic[_ExpectedContentType]):
                             artifact=None,
                             stream_options=None,
                             tool_status=None,
+                            agent_name=self.name,
+                            is_subagent=self._is_subagent,
                         )
+                        self._is_streaming = False
+                        self._stream_intermediate_steps = False
+                        self._stream_subagents = False
                         return
 
             except Exception as e:
@@ -1681,7 +1771,12 @@ class Agent(Generic[_ExpectedContentType]):
                     artifact=None,
                     stream_options=None,
                     tool_status=None,
+                            agent_name=self.name,
+                            is_subagent=self._is_subagent,
                 )
+                self._is_streaming = False
+                self._stream_intermediate_steps = False
+                self._stream_subagents = False
                 return
 
             if call_name:
@@ -1708,6 +1803,8 @@ class Agent(Generic[_ExpectedContentType]):
                         artifact=None,
                         stream_options=None,
                         tool_status=None,
+                            agent_name=self.name,
+                            is_subagent=self._is_subagent,
                     )
 
                 try:
@@ -1716,6 +1813,25 @@ class Agent(Generic[_ExpectedContentType]):
                     logger.error(f"Tool execution failed in async stream: {e}")
                     tool_result = {"error": str(e), "message": "Tool execution failed"}
                     tool_execution_status = "failed"
+
+                if isinstance(tool_result, dict) and tool_result.get("__subagent_stream__"):
+                    sub_agent = tool_result["agent"]
+                    sub_input = tool_result["input"]
+                    
+                    if isinstance(sub_agent, Agent):
+                        accumulated_subagent_content = ""
+                        sub_stream = await sub_agent.arun(sub_input, stream=True, stream_intermediate_steps=True, _is_subagent_call=True)
+                        async for sub_chunk in sub_stream:
+                            if stream_intermediate_steps:
+                                if self._stream_subagents:
+                                    yield sub_chunk
+                                elif sub_chunk.content_type in ["tool_call", "tool_result"]:
+                                    yield sub_chunk
+                            
+                            if sub_chunk.content_type == "str":
+                                accumulated_subagent_content += sub_chunk.content
+                        
+                        tool_result = accumulated_subagent_content or "Sub-agent completed successfully"
 
                 tool_obj = self.tool_maps.get(call_name)
                 return_type = getattr(tool_obj, "return_type", "content")
@@ -1728,6 +1844,9 @@ class Agent(Generic[_ExpectedContentType]):
                     serialised_content = self._process_tool_call_result(tool_result)
 
                 if stream_intermediate_steps:
+                    is_subagent_tool = call_name in self._sub_agent_map
+                    subagent_name = self._sub_agent_map[call_name].name if is_subagent_tool else self.name
+                    
                     yield ThinagentResponseStream(
                         content=serialised_content,
                         content_type="tool_result",
@@ -1743,6 +1862,8 @@ class Agent(Generic[_ExpectedContentType]):
                         artifact=self._tool_artifacts.copy() if self._tool_artifacts else None,
                         stream_options=None,
                         tool_status=tool_execution_status,
+                        agent_name=subagent_name,
+                        is_subagent=is_subagent_tool,
                     )
 
                 assistant_message: Dict[str, Any] = {
@@ -1795,7 +1916,12 @@ class Agent(Generic[_ExpectedContentType]):
             artifact=None,
             stream_options=None,
             tool_status=None,
+                            agent_name=self.name,
+                            is_subagent=self._is_subagent,
         )
+        self._is_streaming = False
+        self._stream_intermediate_steps = False
+        self._stream_subagents = False
 
     @overload
     async def arun(
@@ -1803,8 +1929,10 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         stream: Literal[False] = False,
         stream_intermediate_steps: bool = False,
+        stream_subagents: bool = False,
         conversation_id: Optional[str] = None,
         prompt_vars: Optional[Dict[str, Any]] = None,
+        _is_subagent_call: bool = False,
     ) -> ThinagentResponse[_ExpectedContentType]: ...
 
     @overload
@@ -1813,8 +1941,10 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         stream: Literal[True],
         stream_intermediate_steps: bool = False,
+        stream_subagents: bool = False,
         conversation_id: Optional[str] = None,
         prompt_vars: Optional[Dict[str, Any]] = None,
+        _is_subagent_call: bool = False,
     ) -> AsyncIterator[ThinagentResponseStream[Any]]: ...
 
     async def arun(
@@ -1822,18 +1952,22 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         stream: bool = False,
         stream_intermediate_steps: bool = False,
+        stream_subagents: bool = False,
         conversation_id: Optional[str] = None,
         prompt_vars: Optional[Dict[str, Any]] = None,
+        _is_subagent_call: bool = False,
     ) -> Any:
         if not input or not isinstance(input, str):
             raise ValueError("Input must be a non-empty string")
+
+        self._is_subagent = _is_subagent_call
 
         logger.info(f"Agent '{self.name}' starting async execution with input length: {len(input)}")
 
         if stream:
             if self.response_format_model_type:
                 raise ValueError("Streaming is not supported when response_format is specified.")
-            return self._run_stream_async(input, stream_intermediate_steps, conversation_id, prompt_vars=prompt_vars)
+            return self._run_stream_async(input, stream_intermediate_steps, stream_subagents, conversation_id, prompt_vars=prompt_vars)
 
         return await self._run_async(input, conversation_id, prompt_vars=prompt_vars)
 
@@ -1842,13 +1976,14 @@ class Agent(Generic[_ExpectedContentType]):
         input: str,
         *,
         stream_intermediate_steps: bool = False,
+        stream_subagents: bool = False,
         conversation_id: Optional[str] = None,
         prompt_vars: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[ThinagentResponseStream[Any]]:
 
         if self.response_format_model_type:
             raise ValueError("Streaming is not supported when response_format is specified.")
-        return self._run_stream_async(input, stream_intermediate_steps, conversation_id, prompt_vars=prompt_vars)
+        return self._run_stream_async(input, stream_intermediate_steps, stream_subagents, conversation_id, prompt_vars=prompt_vars)
 
     def _build_messages_with_memory(self, input: str, conversation_id: Optional[str] = None, prompt_vars: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """

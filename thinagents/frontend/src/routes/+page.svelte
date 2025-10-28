@@ -10,6 +10,8 @@
 	import { ArrowUp, Square } from '@lucide/svelte';
 	import { ToolCallResult } from '$lib/components/ai-elements/tool-result';
 	import { Response } from '$lib/components/ai-elements/response';
+	import { AgentCall } from '$lib/components/ai-elements/agent-call';
+	import { ThinkingLoader } from '$lib/components/ai-elements/thinking-loader';
 
 	import { onMount } from 'svelte';
 
@@ -20,9 +22,22 @@
 		status: 'pending' | 'success' | 'error';
 		result?: unknown;
 		error?: string;
+		agentName?: string;
+		isSubagent?: boolean;
 	};
 
-	type MessageItem = { type: 'text'; content: string } | { type: 'tool_call'; data: ToolCallData };
+	type AgentCallData = {
+		agentName: string;
+		isSubagent: boolean;
+		toolCalls: ToolCallData[];
+		nestedAgents: AgentCallData[];
+		textResponse?: string;
+	};
+
+	type MessageItem =
+		| { type: 'text'; content: string }
+		| { type: 'tool_call'; data: ToolCallData }
+		| { type: 'agent_call'; data: AgentCallData };
 
 	type MessageType = {
 		id: string;
@@ -37,6 +52,9 @@
 	let messagesEndRef = $state<HTMLDivElement | null>(null);
 	let currentAssistantMessage: MessageType | null = null;
 	let abortController: AbortController | null = null;
+	let currentAgentBatch: AgentCallData | null = null;
+	let currentAgentBatchIndex: number = -1;
+	let parentAgentStack: AgentCallData[] = [];
 
 	function scrollToBottom() {
 		if (messagesEndRef) {
@@ -45,11 +63,16 @@
 	}
 
 	$effect(() => {
-		console.log('Messages changed:', messages.length, messages);
 		if (messages.length > 0) {
 			scrollToBottom();
 		}
 	});
+
+	function resetAgentHierarchy() {
+		currentAgentBatch = null;
+		currentAgentBatchIndex = -1;
+		parentAgentStack = [];
+	}
 
 	async function handleSubmit() {
 		if (!input.trim() || isLoading) return;
@@ -65,6 +88,8 @@
 		input = '';
 		isLoading = true;
 
+		resetAgentHierarchy();
+
 		const assistantMessageId = crypto.randomUUID();
 		currentAssistantMessage = {
 			id: assistantMessageId,
@@ -72,7 +97,6 @@
 			items: []
 		};
 		messages = [...messages, currentAssistantMessage];
-		console.log('Initial messages:', messages.length);
 
 		try {
 			abortController = new AbortController();
@@ -149,66 +173,225 @@
 								}
 
 								if (data.type === 'text') {
-									console.log('Received text:', data.content);
+									currentAgentBatch = null;
+									currentAgentBatchIndex = -1;
+									parentAgentStack = [];
+
 									const lastItem = updatedMessage.items[updatedMessage.items.length - 1];
 									if (lastItem && lastItem.type === 'text') {
 										lastItem.content += data.content;
-										updatedMessage.items = [...updatedMessage.items];
 									} else {
-										updatedMessage.items = [
-											...updatedMessage.items,
-											{ type: 'text', content: data.content }
-										];
+										updatedMessage.items.push({ type: 'text', content: data.content });
 									}
-									currentAssistantMessage.items = updatedMessage.items;
+
+									currentAssistantMessage.items = [...updatedMessage.items];
 									messages = [...messages.slice(0, -1), updatedMessage];
-									console.log('Messages updated, count:', messages.length);
 								} else if (data.type === 'tool_call') {
-									console.log('Tool call data received:', data);
-									const existingItemIndex = updatedMessage.items.findIndex(
-										(item) => item.type === 'tool_call' && item.data.id === data.tool_call_id
-									);
-									if (existingItemIndex === -1) {
-										console.log('Creating tool call with args:', data.tool_call_args);
-										updatedMessage.items = [
-											...updatedMessage.items,
-											{
-												type: 'tool_call',
-												data: {
-													id: data.tool_call_id,
-													name: data.tool_name,
-													args: data.tool_call_args || {},
-													status: 'pending' as const
+									const agentName = data.agent_name || 'Agent';
+									const isSubagent = data.is_subagent || false;
+									const isSubagentCall = data.tool_name.startsWith('subagent_');
+
+									if (isSubagentCall) {
+										if (!currentAgentBatch || currentAgentBatch.agentName !== agentName) {
+											currentAgentBatch = {
+												agentName,
+												isSubagent,
+												toolCalls: [],
+												nestedAgents: [],
+												textResponse: ''
+											};
+											updatedMessage.items.push({
+												type: 'agent_call',
+												data: currentAgentBatch
+											});
+											currentAgentBatchIndex = updatedMessage.items.length - 1;
+										}
+
+										parentAgentStack.push(currentAgentBatch);
+
+										updatedMessage.items = [...updatedMessage.items];
+										currentAssistantMessage.items = updatedMessage.items;
+										messages = [...messages.slice(0, -1), updatedMessage];
+									} else {
+										const parentAgent =
+											parentAgentStack.length > 0
+												? parentAgentStack[parentAgentStack.length - 1]
+												: null;
+
+										if (parentAgent && isSubagent) {
+											let subagent = parentAgent.nestedAgents.find(
+												(na) => na.agentName === agentName
+											);
+
+											if (!subagent) {
+												subagent = {
+													agentName,
+													isSubagent: true,
+													toolCalls: [],
+													nestedAgents: [],
+													textResponse: ''
+												};
+
+												// Create a NEW parent agent object with the new nested agent
+												const updatedParent: AgentCallData = {
+													...parentAgent,
+													toolCalls: [...parentAgent.toolCalls],
+													nestedAgents: [...parentAgent.nestedAgents, subagent]
+												};
+
+												// Find and replace the parent in the items array BY NAME (not by reference)
+												const parentIndex = updatedMessage.items.findIndex(
+													(item) =>
+														item.type === 'agent_call' &&
+														item.data.agentName === parentAgent.agentName
+												);
+
+												if (parentIndex !== -1) {
+													updatedMessage.items[parentIndex] = {
+														type: 'agent_call',
+														data: updatedParent
+													};
+													updatedMessage.items = [...updatedMessage.items];
+
+													// Update the parent stack to point to the new parent object
+													parentAgentStack[parentAgentStack.length - 1] = updatedParent;
+
+													currentAssistantMessage.items = updatedMessage.items;
+													messages = [...messages.slice(0, -1), updatedMessage];
 												}
 											}
-										];
+
+											currentAgentBatch = subagent;
+										} else {
+											if (!currentAgentBatch || currentAgentBatch.agentName !== agentName) {
+												currentAgentBatch = {
+													agentName,
+													isSubagent,
+													toolCalls: [],
+													nestedAgents: [],
+													textResponse: ''
+												};
+												updatedMessage.items.push({
+													type: 'agent_call',
+													data: currentAgentBatch
+												});
+												currentAgentBatchIndex = updatedMessage.items.length - 1;
+											}
+										}
+
+										const newToolCall = {
+											id: data.tool_call_id,
+											name: data.tool_name,
+											args: data.tool_call_args || {},
+											status: 'pending' as const,
+											agentName,
+											isSubagent
+										};
+										currentAgentBatch.toolCalls.push(newToolCall);
+
+										updatedMessage.items = [...updatedMessage.items];
 										currentAssistantMessage.items = updatedMessage.items;
 										messages = [...messages.slice(0, -1), updatedMessage];
 									}
 								} else if (data.type === 'tool_result') {
-									const itemIndex = updatedMessage.items.findIndex(
-										(item) => item.type === 'tool_call' && item.data.id === data.tool_call_id
-									);
-									if (itemIndex !== -1) {
-										updatedMessage.items = updatedMessage.items.map((item, idx) =>
-											idx === itemIndex && item.type === 'tool_call'
-												? {
+									const isSubagentResult = data.tool_name && data.tool_name.startsWith('subagent_');
+
+									if (isSubagentResult) {
+										// Set textResponse on the nested agent
+										if (currentAgentBatch && currentAgentBatch.agentName === data.agent_name) {
+											currentAgentBatch.textResponse = data.content;
+
+											// Deep clone to force reactivity
+											function cloneAgentWithNestedUpdate(agent: AgentCallData): AgentCallData {
+												return {
+													...agent,
+													toolCalls: [...agent.toolCalls],
+													nestedAgents: agent.nestedAgents.map((nested) =>
+														nested.agentName === data.agent_name
+															? {
+																	...nested,
+																	textResponse: data.content,
+																	toolCalls: [...nested.toolCalls]
+																}
+															: cloneAgentWithNestedUpdate(nested)
+													)
+												};
+											}
+
+											// Update the items array with cloned agents
+											updatedMessage.items = updatedMessage.items.map((item) => {
+												if (item.type === 'agent_call') {
+													return {
 														...item,
-														data: {
-															...item.data,
-															status:
-																data.tool_status === 'error'
-																	? ('error' as const)
-																	: ('success' as const),
-															result: data.content,
-															error: data.tool_status === 'error' ? data.content : undefined
-														}
-													}
-												: item
-										);
+														data: cloneAgentWithNestedUpdate(item.data)
+													};
+												}
+												return item;
+											});
+										}
+
+										// Update parent stack and current batch references to use the new cloned objects
+										if (parentAgentStack.length > 0) {
+											parentAgentStack.pop();
+
+											// Update parent stack to point to cloned objects
+											if (parentAgentStack.length > 0) {
+												const parentAgentName =
+													parentAgentStack[parentAgentStack.length - 1].agentName;
+												const updatedParent = updatedMessage.items.find(
+													(item) =>
+														item.type === 'agent_call' && item.data.agentName === parentAgentName
+												);
+												if (updatedParent && updatedParent.type === 'agent_call') {
+													currentAgentBatch = updatedParent.data;
+													parentAgentStack[parentAgentStack.length - 1] = currentAgentBatch;
+												}
+											} else {
+												currentAgentBatch = null;
+											}
+										} else {
+											currentAgentBatch = null;
+										}
+
+										// Force Svelte reactivity
 										currentAssistantMessage.items = updatedMessage.items;
 										messages = [...messages.slice(0, -1), updatedMessage];
+									} else {
+										function findAndUpdateTool(agent: AgentCallData): boolean {
+											const toolIndex = agent.toolCalls.findIndex(
+												(tc) => tc.id === data.tool_call_id
+											);
+
+											if (toolIndex !== -1) {
+												agent.toolCalls[toolIndex].status =
+													data.tool_status === 'error' ? 'error' : 'success';
+												agent.toolCalls[toolIndex].result = data.content;
+												agent.toolCalls[toolIndex].error =
+													data.tool_status === 'error' ? data.content : undefined;
+												return true;
+											}
+
+											for (const nested of agent.nestedAgents) {
+												if (findAndUpdateTool(nested)) {
+													return true;
+												}
+											}
+
+											return false;
+										}
+
+										for (const item of updatedMessage.items) {
+											if (item.type === 'agent_call') {
+												if (findAndUpdateTool(item.data)) {
+													break;
+												}
+											}
+										}
 									}
+
+									updatedMessage.items = [...updatedMessage.items];
+									currentAssistantMessage.items = updatedMessage.items;
+									messages = [...messages.slice(0, -1), updatedMessage];
 								}
 							}
 						} catch (e) {
@@ -312,10 +495,21 @@
 							</div>
 						{:else}
 							<div class="flex w-full max-w-[85%] flex-col gap-3">
-								{#if message.items && message.items.length > 0}
+								{#if isLoading && (!message.items || message.items.length === 0) && !message.content}
+									<ThinkingLoader />
+								{:else if message.items && message.items.length > 0}
 									{#each message.items as item, idx (idx)}
 										{#if item.type === 'text'}
 											<Response content={item.content} class="text-sm" />
+										{:else if item.type === 'agent_call'}
+											<AgentCall
+												agentName={item.data.agentName}
+												isSubagent={item.data.isSubagent}
+												toolCalls={item.data.toolCalls}
+												nestedAgents={item.data.nestedAgents}
+												textResponse={item.data.textResponse}
+												class="w-full"
+											/>
 										{:else if item.type === 'tool_call'}
 											<ToolCallResult
 												toolName={item.data.name}
