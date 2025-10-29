@@ -15,6 +15,7 @@
 	import { onMount } from 'svelte';
 	import AgentNode from './AgentNode.svelte';
 	import ToolNode from './ToolNode.svelte';
+	import { agentInfoStore } from '$lib/stores.svelte';
 
 	interface Tool {
 		type: string;
@@ -30,6 +31,7 @@
 		model: string;
 		tools: Tool[];
 		sub_agents: AgentInfo[];
+		memory: string;
 	}
 
 	let nodes = $state.raw<Node[]>([]);
@@ -76,6 +78,7 @@
 			data: {
 				label: agentInfo.name,
 				model: agentInfo.model,
+				memory: agentInfo.memory,
 				toolCount: agentInfo.tools.length,
 				subAgentCount: agentInfo.sub_agents.length,
 				level
@@ -199,12 +202,9 @@
 
 	onMount(async () => {
 		try {
-			const response = await fetch('/api/agent/info');
-			if (!response.ok) {
-				throw new Error('Failed to fetch agent info');
-			}
-			const agentInfo: AgentInfo = await response.json();
+			const response = await agentInfoStore.get_agent_info();
 
+			let agentInfo = response as AgentInfo;
 			// Reset counters
 			toolCounter = 0;
 			agentCounter = 0;

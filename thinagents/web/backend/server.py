@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,8 +7,9 @@ import json
 import asyncio
 import thinagents
 from thinagents.core.response_models import ThinagentResponseStream
-from typing import Any
+from typing import Any, Optional
 from pydantic import BaseModel
+import uuid
 
 agent: thinagents.Agent | None = None
 
@@ -31,6 +32,10 @@ def serialize_agent(agent: thinagents.Agent) -> dict:
     sub_agents = getattr(agent, "sub_agents", None) or getattr(agent, "children", None)
     if sub_agents:
         data["sub_agents"] = [serialize_agent(a) for a in sub_agents]
+    
+    memory = getattr(agent, "memory", None)
+    if memory:
+        data["memory"] = memory.__class__.__name__
 
     return data
 
@@ -122,6 +127,32 @@ async def stream_agent(input_text):
         else:
             yield result
 
+async def stream_agent_with_memory(input_text: str, conversation_id: str):
+    if agent is None:
+        yield "Error: No agent configured"
+        return
+
+    if hasattr(agent, "astream"):
+        async for chunk in agent.astream(input_text, stream_intermediate_steps=True, conversation_id=conversation_id):
+            yield chunk
+    elif hasattr(agent, "arun"):
+        result = await agent.arun(
+            input_text, stream=True, stream_intermediate_steps=True, conversation_id=conversation_id
+        )
+        if hasattr(result, "__aiter__"):
+            async for chunk in result:
+                yield chunk
+        else:
+            yield result
+    else:
+        result = agent.run(input_text, stream=True, stream_intermediate_steps=True, conversation_id=conversation_id)
+        if hasattr(result, "__iter__") and not isinstance(result, (str, dict)):
+            for chunk in result:
+                yield chunk
+                await asyncio.sleep(0)
+        else:
+            yield result
+
 
 app = FastAPI(
     title="ThinAgents Web UI",
@@ -145,21 +176,95 @@ async def agent_info():
     return serialize_agent(agent)
 
 
+@app.get("/api/conversations")
+async def list_conversations():
+    if agent is None:
+        raise HTTPException(status_code=500, detail="No agent configured")
+    
+    if not hasattr(agent, "memory") or agent.memory is None:
+        raise HTTPException(status_code=400, detail="Agent does not have memory configured")
+    
+    try:
+        conversations = await agent.alist_conversations()
+        return {"conversations": conversations}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str):
+    if agent is None:
+        raise HTTPException(status_code=500, detail="No agent configured")
+    
+    if not hasattr(agent, "memory") or agent.memory is None:
+        raise HTTPException(status_code=400, detail="Agent does not have memory configured")
+    
+    try:
+        messages = await agent.aget_conversation_history(conversation_id)
+        info = await agent.aget_conversation_info(conversation_id)
+        return {
+            "conversation_id": conversation_id,
+            "messages": messages,
+            "info": info
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class CreateConversationRequest(BaseModel):
+    conversation_id: Optional[str] = None
+
+@app.post("/api/conversations")
+async def create_conversation(request: CreateConversationRequest):
+    if agent is None:
+        raise HTTPException(status_code=500, detail="No agent configured")
+    
+    if not hasattr(agent, "memory") or agent.memory is None:
+        raise HTTPException(status_code=400, detail="Agent does not have memory configured")
+    
+    conversation_id = request.conversation_id or str(uuid.uuid4())
+    
+    return {"conversation_id": conversation_id}
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    if agent is None:
+        raise HTTPException(status_code=500, detail="No agent configured")
+    
+    if not hasattr(agent, "memory") or agent.memory is None:
+        raise HTTPException(status_code=400, detail="Agent does not have memory configured")
+    
+    try:
+        await agent.aclear_memory(conversation_id)
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 
 class AgentRunRequest(BaseModel):
     input: str
+    conversation_id: Optional[str] = None
 
 @app.post("/api/agent/run")
 async def agent_run(request: AgentRunRequest):
     input_text = request.input
+    conversation_id = request.conversation_id
 
     async def event_generator():
         try:
-            async for chunk in stream_agent(input_text):
-                data = format_chunk(chunk)
-                if data:
-                    yield f"data: {json.dumps(data)}\n\n"
+            if conversation_id:
+                async for chunk in stream_agent_with_memory(input_text, conversation_id):
+                    data = format_chunk(chunk) # type: ignore
+                    if data:
+                        yield f"data: {json.dumps(data)}\n\n"
+            else:
+                async for chunk in stream_agent(input_text):
+                    data = format_chunk(chunk) # type: ignore
+                    if data:
+                        yield f"data: {json.dumps(data)}\n\n"
 
             yield f"data: {json.dumps({'done': True})}\n\n"
         except Exception as e:

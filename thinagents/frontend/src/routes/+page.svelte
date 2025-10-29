@@ -14,6 +14,7 @@
 	import { ThinkingLoader } from '$lib/components/ai-elements/thinking-loader';
 
 	import { onMount } from 'svelte';
+	import { conversationStore, agentInfoStore } from '$lib/stores.svelte';
 
 	type ToolCallData = {
 		id: string;
@@ -55,6 +56,123 @@
 	let currentAgentBatch: AgentCallData | null = null;
 	let currentAgentBatchIndex: number = -1;
 	let parentAgentStack: AgentCallData[] = [];
+	let hasMemory = $state(false);
+
+	$effect(() => {
+		agentInfoStore.get_agent_info().then((info) => {
+			hasMemory = !!(info && info.memory);
+		});
+	});
+
+	async function loadConversation(conversationId: string) {
+		try {
+			const res = await fetch(`/api/conversations/${conversationId}`);
+			if (!res.ok) {
+				messages = [];
+				return;
+			}
+			const data = await res.json();
+			const history = Array.isArray(data.messages) ? data.messages : [];
+
+			const mapped: MessageType[] = [];
+			let currentAssistant: MessageType | null = null;
+
+			function ensureAssistant(): MessageType {
+				if (!currentAssistant) {
+					currentAssistant = {
+						id: crypto.randomUUID(),
+						role: 'assistant',
+						items: []
+					};
+					mapped.push(currentAssistant);
+				}
+				return currentAssistant;
+			}
+
+			for (const m of history) {
+				if (m.role === 'user') {
+					mapped.push({
+						id: crypto.randomUUID(),
+						role: 'user',
+						content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
+					});
+					currentAssistant = null;
+				} else if (m.role === 'assistant') {
+					const assistant = ensureAssistant();
+					const text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '');
+					if (!assistant.items) assistant.items = [];
+					const last = assistant.items[assistant.items.length - 1];
+					if (last && last.type === 'text') {
+						last.content += text;
+					} else if (text) {
+						assistant.items.push({ type: 'text', content: text });
+					}
+				} else if (m.role === 'tool') {
+					const assistant = ensureAssistant();
+					if (!assistant.items) assistant.items = [];
+					const name: string = m.name || '';
+					const contentStr =
+						typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '');
+					if (name.startsWith('subagent_')) {
+						const agentName = name.replace(/^subagent_/, '') || 'Agent';
+						assistant.items.push({
+							type: 'agent_call',
+							data: {
+								agentName,
+								isSubagent: true,
+								toolCalls: [],
+								nestedAgents: [],
+								textResponse: contentStr
+							}
+						});
+					} else {
+						const status = m.status === 'failed' ? 'error' : 'success';
+						let error: string | undefined = undefined;
+						let result: unknown = undefined;
+						if (status === 'error') {
+							try {
+								const parsed = JSON.parse(contentStr);
+								error = parsed?.error || contentStr;
+							} catch {
+								error = contentStr;
+							}
+						} else {
+							result = contentStr;
+						}
+						assistant.items.push({
+							type: 'tool_call',
+							data: {
+								id: m.tool_call_id || crypto.randomUUID(),
+								name,
+								args: {},
+								status,
+								result,
+								error
+							}
+						});
+					}
+				}
+			}
+
+			messages = mapped;
+		} catch (e) {
+			console.error('Failed to load conversation', e);
+			messages = [];
+		}
+	}
+
+	$effect(() => {
+		if (!hasMemory) {
+			messages = [];
+			return;
+		}
+		const cid = conversationStore.currentConversationId;
+		if (cid) {
+			loadConversation(cid);
+		} else {
+			messages = [];
+		}
+	});
 
 	function scrollToBottom() {
 		if (messagesEndRef) {
@@ -76,6 +194,10 @@
 
 	async function handleSubmit() {
 		if (!input.trim() || isLoading) return;
+
+		if (hasMemory && !conversationStore.currentConversationId) {
+			await conversationStore.createConversation();
+		}
 
 		const userMessage: MessageType = {
 			id: crypto.randomUUID(),
@@ -101,12 +223,17 @@
 		try {
 			abortController = new AbortController();
 
+			const requestBody: { input: string; conversation_id?: string } = { input: userInput };
+			if (hasMemory && conversationStore.currentConversationId) {
+				requestBody.conversation_id = conversationStore.currentConversationId;
+			}
+
 			const response = await fetch('/api/agent/run', {
 				method: 'POST',
 				headers: {
 					'Content-Type': 'application/json'
 				},
-				body: JSON.stringify({ input: userInput }),
+				body: JSON.stringify(requestBody),
 				signal: abortController.signal
 			});
 
@@ -142,6 +269,9 @@
 							if (data.done) {
 								isLoading = false;
 								currentAssistantMessage = null;
+								if (hasMemory) {
+									await conversationStore.fetchConversations();
+								}
 								break;
 							}
 
@@ -357,35 +487,85 @@
 										currentAssistantMessage.items = updatedMessage.items;
 										messages = [...messages.slice(0, -1), updatedMessage];
 									} else {
-										function findAndUpdateTool(agent: AgentCallData): boolean {
+										function cloneAndUpdateTool(agent: AgentCallData): AgentCallData | null {
 											const toolIndex = agent.toolCalls.findIndex(
 												(tc) => tc.id === data.tool_call_id
 											);
 
 											if (toolIndex !== -1) {
-												agent.toolCalls[toolIndex].status =
-													data.tool_status === 'error' ? 'error' : 'success';
-												agent.toolCalls[toolIndex].result = data.content;
-												agent.toolCalls[toolIndex].error =
-													data.tool_status === 'error' ? data.content : undefined;
-												return true;
+												const updatedToolCalls = [...agent.toolCalls];
+												updatedToolCalls[toolIndex] = {
+													...updatedToolCalls[toolIndex],
+													status: data.tool_status === 'error' ? 'error' : 'success',
+													result: data.content,
+													error: data.tool_status === 'error' ? data.content : undefined
+												};
+
+												return {
+													...agent,
+													toolCalls: updatedToolCalls,
+													nestedAgents: [...agent.nestedAgents]
+												};
 											}
 
-											for (const nested of agent.nestedAgents) {
-												if (findAndUpdateTool(nested)) {
-													return true;
+											let updated = false;
+											const updatedNestedAgents = agent.nestedAgents.map((nested) => {
+												if (updated) return nested;
+												const result = cloneAndUpdateTool(nested);
+												if (result) {
+													updated = true;
+													return result;
 												}
+												return nested;
+											});
+
+											if (updated) {
+												return {
+													...agent,
+													toolCalls: [...agent.toolCalls],
+													nestedAgents: updatedNestedAgents
+												};
 											}
 
-											return false;
+											return null;
 										}
 
-										for (const item of updatedMessage.items) {
+										updatedMessage.items = updatedMessage.items.map((item) => {
 											if (item.type === 'agent_call') {
-												if (findAndUpdateTool(item.data)) {
-													break;
+												const updatedAgent = cloneAndUpdateTool(item.data);
+												if (updatedAgent) {
+													return {
+														type: 'agent_call',
+														data: updatedAgent
+													};
 												}
 											}
+											return item;
+										});
+
+										if (currentAgentBatch && updatedMessage.items) {
+											const updatedCurrentAgent = updatedMessage.items.find(
+												(item) =>
+													item.type === 'agent_call' &&
+													item.data.agentName === currentAgentBatch!.agentName
+											);
+											if (updatedCurrentAgent && updatedCurrentAgent.type === 'agent_call') {
+												currentAgentBatch = updatedCurrentAgent.data;
+											}
+										}
+
+										if (parentAgentStack.length > 0 && updatedMessage.items) {
+											parentAgentStack = parentAgentStack.map((parentAgent) => {
+												const updatedParent = updatedMessage.items!.find(
+													(item) =>
+														item.type === 'agent_call' &&
+														item.data.agentName === parentAgent.agentName
+												);
+												if (updatedParent && updatedParent.type === 'agent_call') {
+													return updatedParent.data;
+												}
+												return parentAgent;
+											});
 										}
 									}
 

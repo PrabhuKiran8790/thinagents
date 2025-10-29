@@ -8,16 +8,15 @@
 
 	// Different border colors for different levels
 	const borderColors = [
-		'border-primary/30 border-2', // Root agent
+		'border-sky-500 border-2', // Root agent
 		'border-purple-500 border-2', // Sub-agent level 1
 		'border-pink-500 border-2', // Sub-agent level 2
 		'border-green-500 border-2' // Sub-agent level 3
 	];
 
-
 	// Different background colors
 	const bgColors = [
-		'bg-card', // Root agent
+		'bg-sky-950/20', // Root agent
 		'bg-purple-950/30', // Sub-agent level 1
 		'bg-pink-950/30', // Sub-agent level 2
 		'bg-green-950/30' // Sub-agent level 3
@@ -43,6 +42,12 @@
 				<span class="text-muted-foreground font-medium">Model:</span>
 				<span class="bg-muted rounded px-2 py-1 font-mono text-xs">{data.model}</span>
 			</div>
+			{#if data.memory}
+				<div class="mb-3 flex items-center gap-2 text-sm">
+					<span class="text-muted-foreground font-medium">Memory:</span>
+					<span class="bg-muted rounded px-2 py-1 font-mono text-xs">{data.memory}</span>
+				</div>
+			{/if}
 			<div class="mt-3 flex gap-4">
 				<div class="bg-muted/50 flex flex-1 flex-col items-center rounded-lg px-3 py-3">
 					<span class="text-2xl font-bold leading-none">{data.toolCount}</span>

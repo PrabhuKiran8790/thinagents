@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { Wrench } from '@lucide/svelte';
 	import { Handle, Position, type NodeProps } from '@xyflow/svelte';
 
 	let { data, isConnectable }: NodeProps = $props();
@@ -14,7 +15,7 @@
 >
 	<div class="flex flex-col">
 		<div class="flex items-center gap-3 border-b p-4 pb-3">
-			<div class="text-xl">🔧</div>
+			<Wrench class="size-4"/>
 			<div class="flex-1">
 				<div class="text-base font-semibold leading-none tracking-tight">{data.label}</div>
 			</div>
