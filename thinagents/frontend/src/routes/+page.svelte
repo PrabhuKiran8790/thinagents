@@ -57,6 +57,8 @@
 	let currentAgentBatchIndex: number = -1;
 	let parentAgentStack: AgentCallData[] = [];
 	let hasMemory = $state(false);
+	let suppressNextConversationLoad = $state(false);
+	let lastLoadedConversationId = $state<string | null>(null);
 
 	$effect(() => {
 		agentInfoStore.get_agent_info().then((info) => {
@@ -76,8 +78,17 @@
 
 			const mapped: MessageType[] = [];
 			let currentAssistant: MessageType | null = null;
+			let accumulatedAssistantText = '';
+			const agentInfo = await agentInfoStore.get_agent_info();
+			const rootAgent = {
+				agentName: agentInfo && agentInfo.name ? agentInfo.name : 'Agent',
+				isSubagent: false,
+				toolCalls: [] as any[],
+				nestedAgents: [] as any[],
+				textResponse: ''
+			};
 
-			function ensureAssistant(): MessageType {
+			function ensureAssistantWithRootAgent(): { assistant: MessageType } {
 				if (!currentAssistant) {
 					currentAssistant = {
 						id: crypto.randomUUID(),
@@ -86,7 +97,30 @@
 					};
 					mapped.push(currentAssistant);
 				}
-				return currentAssistant;
+				if (!currentAssistant.items) currentAssistant.items = [];
+				const hasAgent = currentAssistant.items.some((it) => it.type === 'agent_call');
+				if (!hasAgent) {
+					currentAssistant.items.push({ type: 'agent_call', data: rootAgent });
+				}
+				return { assistant: currentAssistant };
+			}
+
+			function toText(value: unknown): string {
+				if (typeof value === 'string') return value;
+				try {
+					return JSON.stringify(value ?? '');
+				} catch {
+					return String(value ?? '');
+				}
+			}
+
+			function stripEnclosingQuotes(text: string): string {
+				let s = text.trim();
+				// remove one or more layers of surrounding quotes
+				while ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+					s = s.slice(1, -1).trim();
+				}
+				return s;
 			}
 
 			for (const m of history) {
@@ -98,32 +132,21 @@
 					});
 					currentAssistant = null;
 				} else if (m.role === 'assistant') {
-					const assistant = ensureAssistant();
-					const text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '');
-					if (!assistant.items) assistant.items = [];
-					const last = assistant.items[assistant.items.length - 1];
-					if (last && last.type === 'text') {
-						last.content += text;
-					} else if (text) {
-						assistant.items.push({ type: 'text', content: text });
-					}
+					ensureAssistantWithRootAgent();
+					accumulatedAssistantText += stripEnclosingQuotes(toText(m.content));
 				} else if (m.role === 'tool') {
-					const assistant = ensureAssistant();
-					if (!assistant.items) assistant.items = [];
+					ensureAssistantWithRootAgent();
 					const name: string = m.name || '';
 					const contentStr =
 						typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '');
 					if (name.startsWith('subagent_')) {
 						const agentName = name.replace(/^subagent_/, '') || 'Agent';
-						assistant.items.push({
-							type: 'agent_call',
-							data: {
-								agentName,
-								isSubagent: true,
-								toolCalls: [],
-								nestedAgents: [],
-								textResponse: contentStr
-							}
+						rootAgent.nestedAgents.push({
+							agentName,
+							isSubagent: true,
+							toolCalls: [],
+							nestedAgents: [],
+							textResponse: contentStr
 						});
 					} else {
 						const status = m.status === 'failed' ? 'error' : 'success';
@@ -139,19 +162,26 @@
 						} else {
 							result = contentStr;
 						}
-						assistant.items.push({
-							type: 'tool_call',
-							data: {
-								id: m.tool_call_id || crypto.randomUUID(),
-								name,
-								args: {},
-								status,
-								result,
-								error
-							}
+						rootAgent.toolCalls.push({
+							id: m.tool_call_id || crypto.randomUUID(),
+							name: name || 'Tool',
+							args: {},
+							status,
+							result,
+							error
 						});
 					}
 				}
+
+				// after processing this turn, if we have accumulated assistant text, push it as a separate text item
+				// this mirrors streaming where final text is outside the agent accordion
+			}
+
+			if (currentAssistant && accumulatedAssistantText.trim()) {
+				const textItem: MessageItem = { type: 'text', content: accumulatedAssistantText };
+				const assistantRef = currentAssistant as MessageType;
+				assistantRef.items = (assistantRef.items ?? []) as MessageItem[];
+				assistantRef.items.push(textItem);
 			}
 
 			messages = mapped;
@@ -164,14 +194,25 @@
 	$effect(() => {
 		if (!hasMemory) {
 			messages = [];
+			lastLoadedConversationId = null;
 			return;
 		}
 		const cid = conversationStore.currentConversationId;
-		if (cid) {
-			loadConversation(cid);
-		} else {
+		if (!cid) {
 			messages = [];
+			lastLoadedConversationId = null;
+			return;
 		}
+		if (isLoading) return;
+		if (suppressNextConversationLoad) {
+			suppressNextConversationLoad = false;
+			lastLoadedConversationId = cid;
+			return;
+		}
+		if (lastLoadedConversationId === cid) return;
+		loadConversation(cid).then(() => {
+			lastLoadedConversationId = cid;
+		});
 	});
 
 	function scrollToBottom() {
@@ -196,6 +237,7 @@
 		if (!input.trim() || isLoading) return;
 
 		if (hasMemory && !conversationStore.currentConversationId) {
+			suppressNextConversationLoad = true;
 			await conversationStore.createConversation();
 		}
 
